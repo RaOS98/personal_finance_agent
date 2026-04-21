@@ -144,3 +144,7 @@ cython_debug/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local images: keep folder in repo, do not commit contents
+storage/images/*
+!storage/images/.gitkeep

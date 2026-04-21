@@ -12,8 +12,8 @@ Fields to extract:
 - amount: The total amount charged. Use the final total, not subtotals.
 - currency: "PEN" for soles (S/.) or "USD" for dollars ($).
 - date: The transaction date in YYYY-MM-DD format. If not visible, use null.
-- payment_method_alias: The payment method mentioned in the user message. Extract the keyword as-is (e.g., "sapphire", "amex", "yape", "cash"). If not mentioned, use null.
-- category_hint: What the spend was for, in a few words from the user message, excluding payment-method names. Include meal/activity words (e.g., "lunch", "dinner", "coffee", "groceries", "taxi", "gas") even if informal. For "lunch, yape" use category_hint "lunch" and payment_method_alias "yape". If the user gives no purchase-purpose words, use null.
+- payment_method_alias: The payment method used. Check both the image and the user message. For app screenshots, identify the platform from branding or UI elements (e.g., Yape logo or "Yapeaste" → "yape", Plin logo → "plin"). From the user message, extract the keyword as-is (e.g., "sapphire/visa", "platinum/amex", "yape", "cash"). If neither source reveals the payment method, use null.
+- category_hint: What the spend was for, in a few words. Check both the user message and any description visible in the image (e.g., a receipt line item or Yape memo like "Limpieza departamento"). Exclude payment-method names. Include meal/activity words (e.g., "lunch", "dinner", "coffee", "groceries", "taxi", "gas") even if informal. For "lunch, yape" use category_hint "lunch" and payment_method_alias "yape". If neither the user message nor the image describe the purpose, use null.
 
 Rules:
 - If the image is unreadable or missing, extract what you can from the user message alone and set unreadable fields to null.

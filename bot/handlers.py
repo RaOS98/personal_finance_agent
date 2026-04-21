@@ -71,12 +71,13 @@ def format_transaction_summary(txn: dict) -> str:
 
     return (
         f"📝 New transaction:\n"
-        f"  Merchant:  {txn.get('merchant') or '—'}\n"
-        f"  Amount:    {currency_symbol} {txn.get('amount', '—')}\n"
-        f"  Date:      {txn_date}\n"
-        f"  Currency:  {txn.get('currency', '—')}\n"
-        f"  Category:  {category_name}\n"
-        f"  Paid with: {payment_name}"
+        f"  Merchant:     {txn.get('merchant') or '—'}\n"
+        f"  Description:  {txn.get('description') or '—'}\n"
+        f"  Amount:       {currency_symbol} {txn.get('amount', '—')}\n"
+        f"  Date:         {txn_date}\n"
+        f"  Currency:     {txn.get('currency', '—')}\n"
+        f"  Category:     {category_name}\n"
+        f"  Paid with:    {payment_name}"
     )
 
 
@@ -241,6 +242,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         cat_result.get("category_slug"), None
     )
     extracted["needs_description"] = cat_result.get("needs_description", False)
+
+    if not extracted.get("description") and extracted.get("category_hint"):
+        extracted["description"] = extracted["category_hint"]
 
     # Attach image metadata
     extracted["telegram_image_id"] = telegram_image_id

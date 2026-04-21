@@ -26,7 +26,7 @@ Rules:
 - When assigning "other", set needs_description to true.
 - Set confident to false only when the category is genuinely ambiguous after considering the user's words and merchant.
 
-Respond with ONLY a JSON object, no other text."""
+Respond with ONLY a JSON object with exactly these keys: category_slug, confident, needs_description. No other text."""
 
 NULL_RESULT = {
     "category_slug": None,
