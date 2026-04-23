@@ -407,7 +407,13 @@ async def _handle_missing_field(
     state: dict,
 ) -> None:
     field = state.get("missing_field")
-    value = update.message.text.strip()
+    text = update.message.text if update.message else None
+    if not text:
+        await update.message.reply_text(
+            "Please reply with a text value for this field."
+        )
+        return
+    value = text.strip()
     txn = state["pending_txn"]
 
     if field == "amount":

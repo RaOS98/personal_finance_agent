@@ -23,7 +23,7 @@ S3_BUCKET = os.environ.get("BUCKET_NAME", "")
 # Bedrock model IDs
 EXTRACTOR_MODEL_ID = os.environ.get(
     "EXTRACTOR_MODEL_ID",
-    "us.anthropic.claude-sonnet-4-6-20250929-v1:0",
+    "us.anthropic.claude-sonnet-4-6",
 )
 CLASSIFIER_MODEL_ID = os.environ.get(
     "CLASSIFIER_MODEL_ID",

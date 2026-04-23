@@ -24,7 +24,7 @@ The agent performs four distinct tasks. Each task has its own system prompt, inp
 
 **Purpose:** Extract structured transaction data from an image and/or user message.
 
-**Model:** Claude Sonnet 4.6 (`us.anthropic.claude-sonnet-4-6-20250929-v1:0`)
+**Model:** Claude Sonnet 4.6 (`us.anthropic.claude-sonnet-4-6`)
 
 **File:** `agent/extractor.py`
 
