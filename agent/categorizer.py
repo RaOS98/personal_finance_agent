@@ -1,22 +1,35 @@
-import json
+"""Transaction categorization via Amazon Bedrock (Claude Haiku 4.5)."""
 
-import ollama
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+import boto3
+from botocore.config import Config as BotoConfig
 
 import config
+
+
+logger = logging.getLogger(__name__)
+
 
 SYSTEM_PROMPT = """You are a transaction categorizer. You receive a merchant name, amount, an optional structured category_hint from an upstream extractor, and sometimes the user's full Telegram caption or message verbatim.
 
 Available categories:
-1. food_dining — Restaurants, delivery apps, cafés
-2. groceries — Supermarkets, markets, bodegas
-3. transportation — Fuel, taxis, Uber, parking, tolls
-4. housing — Rent, maintenance, repairs, home services
-5. utilities — Electricity, water, gas, internet, phone
-6. health — Pharmacy, doctors, gym, insurance
-7. entertainment — Streaming, outings, events, hobbies
-8. shopping — Clothing, electronics, household items
-9. education — Courses, books, learning subscriptions
-10. other — Only when none of the above fit
+1. food_dining - Restaurants, delivery apps, cafes
+2. groceries - Supermarkets, markets, bodegas
+3. transportation - Fuel, taxis, Uber, parking, tolls
+4. housing - Rent, maintenance, repairs, home services
+5. utilities - Electricity, water, gas, internet, phone
+6. health - Pharmacy, doctors, clinics, insurance, medical
+7. personal_care - Haircuts, salons, barbers, grooming, cosmetics, spa, gym
+8. entertainment - Streaming, outings, events, hobbies
+9. shopping - Clothing, electronics, household items
+10. education - Courses, books, learning subscriptions
+11. work - Work-related expenses (business meals, coworking, office supplies, work travel)
+12. other - Only when none of the above fit
 
 Rules:
 - When a "User's own caption or message" line is present, treat the user's natural-language description of the spend as the strongest signal for category. Casual words (lunch, dinner, coffee, uber, rent, etc.) often map clearly to one category.
@@ -28,15 +41,22 @@ Rules:
 
 Respond with ONLY a JSON object with exactly these keys: category_slug, confident, needs_description. No other text."""
 
-NULL_RESULT = {
+
+NULL_RESULT: dict[str, Any] = {
     "category_slug": None,
     "confident": False,
     "needs_description": False,
 }
 
 
-def _parse_response(content: str) -> dict:
-    """Parse JSON from the LLM response, stripping markdown fences if present."""
+_bedrock = boto3.client(
+    "bedrock-runtime",
+    region_name=config.BEDROCK_REGION,
+    config=BotoConfig(retries={"max_attempts": 3, "mode": "standard"}),
+)
+
+
+def _parse_json(content: str) -> dict:
     text = content.strip()
     if text.startswith("```"):
         lines = text.split("\n")
@@ -53,20 +73,11 @@ def categorize_transaction(
     category_hint: str | None,
     user_note: str | None = None,
 ) -> dict:
-    """Categorize a transaction via Ollama.
+    """Categorize a transaction via Bedrock.
 
-    Args:
-        merchant: The merchant/business name, or None.
-        amount: The transaction amount, or None if not yet known.
-        category_hint: Optional short hint from the extractor JSON.
-        user_note: Verbatim user message or photo caption; primary signal when present.
-
-    Returns:
-        A dict with keys: category_slug, confident, needs_description.
-        On failure, returns defaults with an "error" key.
+    Returns a dict with keys: category_slug, confident, needs_description.
+    On failure, returns defaults with an "error" key.
     """
-    client = ollama.Client(host=config.OLLAMA_BASE_URL)
-
     lines = [
         f"Merchant: {merchant or 'Unknown'}",
         f"Amount: {amount if amount is not None else 'Unknown'}",
@@ -78,18 +89,28 @@ def categorize_transaction(
         lines.append(f"User's own caption or message (verbatim): {note}")
     user_content = "\n".join(lines)
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
+    messages = [{"role": "user", "content": [{"text": user_content}]}]
+
+    system = [
+        {"text": SYSTEM_PROMPT},
+        {"cachePoint": {"type": "default"}},
     ]
 
     for attempt in range(2):
         try:
-            response = client.chat(model=config.OLLAMA_MODEL, messages=messages)
-            return _parse_response(response["message"]["content"])
-        except (json.JSONDecodeError, KeyError):
+            response = _bedrock.converse(
+                modelId=config.CLASSIFIER_MODEL_ID,
+                system=system,
+                messages=messages,
+                inferenceConfig={"maxTokens": 256, "temperature": 0.0},
+            )
+            output_text = response["output"]["message"]["content"][0]["text"]
+            return _parse_json(output_text)
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
             if attempt == 0:
+                logger.warning("Categorizer parse retry: %s", e)
                 continue
             return {**NULL_RESULT, "error": "Failed to parse LLM response as JSON"}
         except Exception as e:
-            return {**NULL_RESULT, "error": f"Ollama request failed: {e}"}
+            logger.exception("Categorizer Bedrock call failed")
+            return {**NULL_RESULT, "error": f"Bedrock request failed: {e}"}

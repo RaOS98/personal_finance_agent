@@ -1,7 +1,6 @@
 """Personal Finance Dashboard - Streamlit Application."""
 
 import streamlit as st
-import psycopg
 import pandas as pd
 import plotly.express as px
 from datetime import date, timedelta
@@ -9,7 +8,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import DATABASE_URL
+from dashboard import dynamo_reader as reader
 
 # ---------------------------------------------------------------------------
 # App config
@@ -18,81 +17,34 @@ st.set_page_config(page_title="Personal Finance", page_icon="$", layout="wide")
 
 COLOR_SEQUENCE = px.colors.qualitative.Set2
 
-# ---------------------------------------------------------------------------
-# Database helpers
-# ---------------------------------------------------------------------------
-
-def _run_query(sql: str, params: dict | None = None) -> pd.DataFrame:
-    """Execute *sql* with *params* and return a DataFrame."""
-    with psycopg.connect(DATABASE_URL) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params or {})
-            cols = [d[0] for d in cur.description]
-            rows = cur.fetchall()
-    return pd.DataFrame(rows, columns=cols)
-
 
 # ---------------------------------------------------------------------------
-# Cached query functions
+# Cached query functions (thin wrappers over dynamo_reader)
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=60)
 def get_monthly_totals(year: int, month: int) -> pd.DataFrame:
-    """Total spent per currency for a given month."""
-    return _run_query(
-        """
-        SELECT currency, SUM(amount) AS total, COUNT(*) AS txn_count
-        FROM transactions
-        WHERE EXTRACT(YEAR FROM date) = %(y)s
-          AND EXTRACT(MONTH FROM date) = %(m)s
-        GROUP BY currency
-        """,
-        {"y": year, "m": month},
-    )
+    return reader.get_monthly_totals(year, month)
 
 
 @st.cache_data(ttl=60)
 def get_spending_by_category(year: int, month: int) -> pd.DataFrame:
-    return _run_query(
-        """
-        SELECT c.name AS category, t.currency, SUM(t.amount) AS total
-        FROM transactions t
-        JOIN categories c ON c.id = t.category_id
-        WHERE EXTRACT(YEAR FROM date) = %(y)s
-          AND EXTRACT(MONTH FROM date) = %(m)s
-        GROUP BY c.name, t.currency
-        ORDER BY total DESC
-        """,
-        {"y": year, "m": month},
-    )
+    return reader.get_spending_by_category(year, month)
 
 
 @st.cache_data(ttl=60)
 def get_spending_by_payment_method(year: int, month: int) -> pd.DataFrame:
-    return _run_query(
-        """
-        SELECT pm.name AS payment_method, t.currency, SUM(t.amount) AS total
-        FROM transactions t
-        JOIN payment_methods pm ON pm.id = t.payment_method_id
-        WHERE EXTRACT(YEAR FROM date) = %(y)s
-          AND EXTRACT(MONTH FROM date) = %(m)s
-        GROUP BY pm.name, t.currency
-        ORDER BY total DESC
-        """,
-        {"y": year, "m": month},
-    )
+    return reader.get_spending_by_payment_method(year, month)
 
 
 @st.cache_data(ttl=60)
 def get_categories() -> list[str]:
-    df = _run_query("SELECT name FROM categories ORDER BY name")
-    return df["name"].tolist() if not df.empty else []
+    return reader.get_categories()
 
 
 @st.cache_data(ttl=60)
 def get_payment_methods() -> list[str]:
-    df = _run_query("SELECT name FROM payment_methods ORDER BY name")
-    return df["name"].tolist() if not df.empty else []
+    return reader.get_payment_methods()
 
 
 @st.cache_data(ttl=60)
@@ -102,113 +54,32 @@ def get_category_transactions(
     end_date: date,
     payment_method: str | None = None,
 ) -> pd.DataFrame:
-    sql = """
-        SELECT t.date, t.merchant, t.amount, t.currency,
-               pm.name AS payment_method, t.description
-        FROM transactions t
-        JOIN categories c ON c.id = t.category_id
-        JOIN payment_methods pm ON pm.id = t.payment_method_id
-        WHERE c.name = %(cat)s
-          AND t.date BETWEEN %(start)s AND %(end)s
-    """
-    params: dict = {"cat": category, "start": start_date, "end": end_date}
-    if payment_method:
-        sql += " AND pm.name = %(pm)s"
-        params["pm"] = payment_method
-    sql += " ORDER BY t.date DESC"
-    return _run_query(sql, params)
+    return reader.get_category_transactions(category, start_date, end_date, payment_method)
 
 
 @st.cache_data(ttl=60)
 def get_monthly_spending_trend(start_date: date, end_date: date) -> pd.DataFrame:
-    return _run_query(
-        """
-        SELECT TO_CHAR(date, 'YYYY-MM') AS month,
-               currency,
-               SUM(amount) AS total
-        FROM transactions
-        WHERE date BETWEEN %(start)s AND %(end)s
-        GROUP BY month, currency
-        ORDER BY month
-        """,
-        {"start": start_date, "end": end_date},
-    )
+    return reader.get_monthly_spending_trend(start_date, end_date)
 
 
 @st.cache_data(ttl=60)
 def get_category_trend(start_date: date, end_date: date) -> pd.DataFrame:
-    return _run_query(
-        """
-        SELECT TO_CHAR(t.date, 'YYYY-MM') AS month,
-               c.name AS category,
-               SUM(t.amount) AS total
-        FROM transactions t
-        JOIN categories c ON c.id = t.category_id
-        WHERE t.date BETWEEN %(start)s AND %(end)s
-        GROUP BY month, c.name
-        ORDER BY month
-        """,
-        {"start": start_date, "end": end_date},
-    )
+    return reader.get_category_trend(start_date, end_date)
 
 
 @st.cache_data(ttl=60)
 def get_reconciliation_summary(year: int, month: int) -> dict:
-    txn = _run_query(
-        """
-        SELECT reconciliation_status, COUNT(*) AS cnt
-        FROM transactions
-        WHERE EXTRACT(YEAR FROM date) = %(y)s
-          AND EXTRACT(MONTH FROM date) = %(m)s
-        GROUP BY reconciliation_status
-        """,
-        {"y": year, "m": month},
-    )
-    billing = f"{year:04d}-{month:02d}"
-    sl = _run_query(
-        """
-        SELECT reconciliation_status, COUNT(*) AS cnt
-        FROM statement_lines
-        WHERE billing_period = %(bp)s
-        GROUP BY reconciliation_status
-        """,
-        {"bp": billing},
-    )
-    return {"transactions": txn, "statement_lines": sl}
+    return reader.get_reconciliation_summary(year, month)
 
 
 @st.cache_data(ttl=60)
 def get_pending_statement_lines(year: int, month: int) -> pd.DataFrame:
-    billing = f"{year:04d}-{month:02d}"
-    return _run_query(
-        """
-        SELECT sl.date, sl.description, sl.amount, a.name AS account,
-               sl.reconciliation_status
-        FROM statement_lines sl
-        JOIN accounts a ON a.id = sl.account_id
-        WHERE sl.billing_period = %(bp)s
-          AND sl.reconciliation_status IN ('pending')
-        ORDER BY sl.date
-        """,
-        {"bp": billing},
-    )
+    return reader.get_pending_statement_lines(year, month)
 
 
 @st.cache_data(ttl=60)
 def get_unreconciled_transactions(year: int, month: int) -> pd.DataFrame:
-    return _run_query(
-        """
-        SELECT t.date, t.merchant, t.amount, t.currency,
-               pm.name AS payment_method, t.reconciliation_status
-        FROM transactions t
-        JOIN payment_methods pm ON pm.id = t.payment_method_id
-        WHERE EXTRACT(YEAR FROM t.date) = %(y)s
-          AND EXTRACT(MONTH FROM t.date) = %(m)s
-          AND t.reconciliation_status = 'unreconciled'
-        ORDER BY t.date
-        """,
-        {"y": year, "m": month},
-    )
+    return reader.get_unreconciled_transactions(year, month)
 
 
 # ---------------------------------------------------------------------------

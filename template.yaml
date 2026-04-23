@@ -1,0 +1,143 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Personal Finance Agent - serverless migration (DynamoDB + Bedrock + Lambda)
+
+Parameters:
+  AllowedUserId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /pfa/allowed-user-id
+  ExtractorModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-6-20250929-v1:0
+  ClassifierModelId:
+    Type: String
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
+  ReconcilerModelId:
+    Type: String
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 512
+    Architectures: [arm64]
+
+Resources:
+
+  # ---------- Data layer ----------
+
+  FinanceAgentTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: finance-agent
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: PK,     AttributeType: S }
+        - { AttributeName: SK,     AttributeType: S }
+        - { AttributeName: GSI1PK, AttributeType: S }
+        - { AttributeName: GSI1SK, AttributeType: S }
+        - { AttributeName: GSI2PK, AttributeType: S }
+        - { AttributeName: GSI2SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - { AttributeName: GSI1PK, KeyType: HASH }
+            - { AttributeName: GSI1SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: GSI2
+          KeySchema:
+            - { AttributeName: GSI2PK, KeyType: HASH }
+            - { AttributeName: GSI2SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  ReceiptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub pfa-receipts-${AWS::AccountId}
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: MoveToIA
+            Status: Enabled
+            Transitions:
+              - { StorageClass: STANDARD_IA, TransitionInDays: 30 }
+          - Id: ExpireTmp
+            Status: Enabled
+            Prefix: receipts/tmp/
+            ExpirationInDays: 1
+
+  # ---------- Compute ----------
+
+  BotFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: pfa-bot
+      CodeUri: .
+      Handler: lambda_handler.handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FinanceAgentTable
+          BUCKET_NAME: !Ref ReceiptsBucket
+          ALLOWED_USER_ID: !Ref AllowedUserId
+          EXTRACTOR_MODEL_ID: !Ref ExtractorModelId
+          CLASSIFIER_MODEL_ID: !Ref ClassifierModelId
+          RECONCILER_MODEL_ID: !Ref ReconcilerModelId
+          BEDROCK_REGION: !Ref AWS::Region
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FinanceAgentTable
+        - S3CrudPolicy:
+            BucketName: !Ref ReceiptsBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:Converse
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/pfa/telegram-bot-token
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/pfa/telegram-webhook-secret
+            - Effect: Allow
+              Action: kms:Decrypt
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub ssm.${AWS::Region}.amazonaws.com
+      Events:
+        TelegramWebhook:
+          Type: HttpApi
+          Properties:
+            Path: /telegram/webhook
+            Method: POST
+
+  BotFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${BotFunction}
+      RetentionInDays: 7
+
+Outputs:
+  WebhookUrl:
+    Description: Copy this into Telegram's setWebhook call
+    Value: !Sub https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/telegram/webhook
+  TableName:
+    Value: !Ref FinanceAgentTable
+  BucketName:
+    Value: !Ref ReceiptsBucket
