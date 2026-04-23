@@ -8,9 +8,11 @@ CATEGORIES = [
     ("Housing", "housing"),
     ("Utilities", "utilities"),
     ("Health", "health"),
+    ("Personal Care", "personal_care"),
     ("Entertainment", "entertainment"),
     ("Shopping", "shopping"),
     ("Education", "education"),
+    ("Work", "work"),
     ("Other", "other"),
 ]
 

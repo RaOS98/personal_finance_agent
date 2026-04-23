@@ -2,7 +2,9 @@
 
 ## Overview
 
-This document defines how the AI agent behaves: what prompts it receives, how it processes inputs, what outputs it produces, and the rules it follows. The agent is powered by Gemma4 31B running locally via Ollama and is called by the Python application — it does not interact with the user directly. The Telegram bot handles all user communication and passes structured requests to the agent.
+This document defines how the AI agent behaves: what prompts it receives, how it processes inputs, what outputs it produces, and the rules it follows. The agent is powered by Amazon Bedrock — Claude Sonnet 4.6 for vision extraction, Claude Haiku 4.5 for categorization and reconciliation — called via the Bedrock Converse API. The Telegram bot handles all user communication and passes structured requests to the agent.
+
+All LLM calls use the Converse API with `cachePoint` system prompt blocks for prompt caching. Retries on JSON parse failure are handled internally.
 
 ## General Principles
 
@@ -22,18 +24,18 @@ The agent performs four distinct tasks. Each task has its own system prompt, inp
 
 **Purpose:** Extract structured transaction data from an image and/or user message.
 
-**Input:**
-```json
-{
-  "image": "<base64 encoded image or null>",
-  "user_message": "Sapphire, groceries"
-}
-```
+**Model:** Claude Sonnet 4.6 (`us.anthropic.claude-sonnet-4-6-20250929-v1:0`)
+
+**File:** `agent/extractor.py`
+
+**Function signature:** `extract_transaction(image_bytes: bytes | None, user_message: str) -> dict`
+
+**Input:** Image bytes (JPEG/PNG/WEBP/GIF) passed as a Bedrock image content block, plus a text message string.
 
 **System prompt:**
 ```
-You are a transaction data extractor. You receive an image of a receipt, 
-transfer screenshot, or payment confirmation, along with an optional user 
+You are a transaction data extractor. You receive an image of a receipt,
+transfer screenshot, or payment confirmation, along with an optional user
 message. Extract the following fields from the image and message.
 
 Fields to extract:
@@ -41,14 +43,14 @@ Fields to extract:
 - amount: The total amount charged. Use the final total, not subtotals.
 - currency: "PEN" for soles (S/.) or "USD" for dollars ($).
 - date: The transaction date in YYYY-MM-DD format. If not visible, use null.
-- payment_method_alias: The payment method mentioned in the user message. 
+- payment_method_alias: The payment method mentioned in the user message.
   Extract the keyword as-is (e.g., "sapphire", "amex", "yape", "cash").
   If not mentioned, use null.
-- category_hint: Any category-related keyword from the user message 
+- category_hint: Any category-related keyword from the user message
   (e.g., "groceries", "food", "taxi"). If not mentioned, use null.
 
 Rules:
-- If the image is unreadable or missing, extract what you can from the 
+- If the image is unreadable or missing, extract what you can from the
   user message alone and set unreadable fields to null.
 - Never invent or guess values. Use null for anything you cannot determine.
 - If multiple amounts appear (subtotal, tax, tip, total), use the final total.
@@ -69,17 +71,7 @@ Respond with ONLY a JSON object, no other text.
 }
 ```
 
-**Null field example (blurry receipt, no date visible):**
-```json
-{
-  "merchant": null,
-  "amount": 45.00,
-  "currency": "PEN",
-  "date": null,
-  "payment_method_alias": "amex",
-  "category_hint": null
-}
-```
+**Error handling:** On JSON parse failure, the call is retried once. If it fails twice, the raw response is logged and the bot asks the user to re-send or provide the transaction manually.
 
 ---
 
@@ -87,18 +79,15 @@ Respond with ONLY a JSON object, no other text.
 
 **Purpose:** Assign a category to a transaction based on extracted data and user hint.
 
-**Input:**
-```json
-{
-  "merchant": "Wong Supermercados",
-  "amount": 145.30,
-  "category_hint": "groceries"
-}
-```
+**Model:** Claude Haiku 4.5 (`us.anthropic.claude-haiku-4-5-20251001-v1:0`)
+
+**File:** `agent/categorizer.py`
+
+**Function signature:** `categorize_transaction(merchant, amount, category_hint, user_note=None) -> dict`
 
 **System prompt:**
 ```
-You are a transaction categorizer. Given a merchant name, amount, and an 
+You are a transaction categorizer. Given a merchant name, amount, and an
 optional category hint from the user, assign the most appropriate category.
 
 Available categories:
@@ -107,15 +96,17 @@ Available categories:
 3. transportation — Fuel, taxis, Uber, parking, tolls
 4. housing — Rent, maintenance, repairs, home services
 5. utilities — Electricity, water, gas, internet, phone
-6. health — Pharmacy, doctors, gym, insurance
-7. entertainment — Streaming, outings, events, hobbies
-8. shopping — Clothing, electronics, household items
-9. education — Courses, books, learning subscriptions
-10. other — Only when none of the above fit
+6. health — Pharmacy, doctors, clinics, insurance, medical
+7. personal_care — Haircuts, salons, barbers, grooming, cosmetics, spa, gym
+8. entertainment — Streaming, outings, events, hobbies
+9. shopping — Clothing, electronics, household items
+10. education — Courses, books, learning subscriptions
+11. work — Work-related expenses (business meals, coworking, office supplies, work travel)
+12. other — Only when none of the above fit
 
 Rules:
 - If the user provided a category hint, respect it unless it is clearly wrong.
-- Use the merchant name to validate or infer the category when the hint is 
+- Use the merchant name to validate or infer the category when the hint is
   absent or ambiguous.
 - When assigning "other", set needs_description to true.
 - If you are not confident in the categorization, set confident to false.
@@ -132,28 +123,26 @@ Respond with ONLY a JSON object, no other text.
 }
 ```
 
-**Low confidence example:**
-```json
-{
-  "category_slug": "shopping",
-  "confident": false,
-  "needs_description": false
-}
-```
-
 When `confident` is false, the bot presents the category options to the user for manual selection instead of using the agent's suggestion.
 
 ---
 
 ### Task 3: Statement Line Parsing
 
-**Purpose:** Extract structured line items from a bank statement PDF. This task does not use the LLM — it is handled entirely in Python using `pdfplumber`.
+**Purpose:** Extract structured line items from a bank statement PDF.
+
+**Model:** None — handled entirely in Python with `pdfplumber`.
+
+**File:** `agent/statement_parser.py`
+
+**Function signature:** `parse_statement_pdf(pdf_source: str | bytes) -> list[dict]`
 
 **Process:**
-1. Extract all text from the PDF using `pdfplumber`
-2. Identify the tabular transaction section (date, description, amount columns)
-3. Parse each row into a structured line item
-4. Return the list of line items
+1. Open the PDF with `pdfplumber`
+2. Iterate all pages and extract tables
+3. Match rows where the first cell is a `DD/MM/YYYY` or `DD/MM` date
+4. Parse each matching row into `{date, description, amount}`
+5. Skip rows with zero or negative amounts (credits)
 
 **Output format (per line):**
 ```json
@@ -165,15 +154,23 @@ When `confident` is false, the bot presents the category options to the user for
 ```
 
 **Notes:**
-- This is Python code, not an LLM call. Statement PDFs from BCP have selectable text and a consistent tabular format, making programmatic parsing more reliable than LLM extraction.
-- If the PDF format changes or parsing fails, the system should surface the error to the user rather than guessing.
-- Statement parsing logic will need to be adapted per bank/card when additional accounts are added post-MVP. For the MVP, only BCP statement formats need to be handled.
+- BCP statements contain selectable text, so OCR is not needed.
+- If parsing fails or no lines are found, `ValueError` is raised and the bot surfaces the error to the user.
+- Statement parsing logic will need to be adapted per bank/card when additional accounts are added. For now, only BCP statement formats are handled.
 
 ---
 
-### Task 4: Reconciliation Matching
+### Task 4: Reconciliation Matching (Batched)
 
-**Purpose:** Evaluate whether a logged transaction matches a bank statement line.
+**Purpose:** Evaluate whether a bank statement line matches one or more logged transactions.
+
+**Model:** Claude Haiku 4.5 (`us.anthropic.claude-haiku-4-5-20251001-v1:0`)
+
+**File:** `agent/reconciler.py`
+
+**Function signature:** `evaluate_matches(statement_line: dict, candidates: list[dict]) -> list[dict]`
+
+All candidates for a given statement line are evaluated in a **single Bedrock call**. The model returns a verdict for each candidate, aligned to the input order.
 
 **Input:**
 ```json
@@ -183,62 +180,65 @@ When `confident` is false, the bot presents the category options to the user for
     "description": "CENCOSUD RETAIL SA",
     "amount": 145.30
   },
-  "candidate_transaction": {
-    "date": "2026-04-13",
-    "merchant": "Wong Supermercados",
-    "amount": 145.30,
-    "category": "Groceries"
-  }
+  "candidates": [
+    {
+      "index": 0,
+      "date": "2026-04-13",
+      "merchant": "Wong Supermercados",
+      "amount": 145.30,
+      "category": "Groceries"
+    }
+  ]
 }
 ```
 
-Note: By the time the agent sees this input, Python has already pre-filtered candidates by exact amount match and date proximity (±5 days) within the same settlement account. The agent only evaluates semantic similarity.
+By the time the agent sees this input, Python has already pre-filtered candidates by exact amount match and date proximity (±5 days via GSI1 range query) within the same settlement account.
 
 **System prompt:**
 ```
-You are a bank reconciliation assistant. You receive a line from a bank 
-statement and a candidate transaction logged by the user. Both have the 
-same amount and similar dates. Your job is to determine whether they 
-represent the same real-world transaction.
+You are a bank reconciliation assistant. You receive a line from a bank
+statement and a list of candidate transactions logged by the user. All
+candidates have the same amount and similar dates. Your job is to
+determine whether each candidate represents the same real-world
+transaction as the statement line.
 
 Evaluate based on:
-- Merchant name similarity: Bank statements often use abbreviated or 
-  corporate names (e.g., "CENCOSUD RETAIL SA" for Wong supermarket, 
-  "UBER *TRIP" for an Uber ride). Consider whether the statement 
+- Merchant name similarity: Bank statements often use abbreviated or
+  corporate names (e.g., "CENCOSUD RETAIL SA" for Wong supermarket,
+  "UBER *TRIP" for an Uber ride). Consider whether the statement
   description plausibly refers to the same merchant.
-- Date consistency: Small differences (1-2 days) are normal due to 
+- Date consistency: Small differences (1-2 days) are normal due to
   posting delays. Larger gaps are suspicious.
-- Context: The transaction category may help confirm the match 
-  (e.g., a "Transportation" transaction matching "UBER *TRIP").
+- Context: The transaction category may help confirm the match.
 
-Assign one of three verdicts:
+Assign one of three verdicts per candidate:
 
-CONFIDENT — Clearly the same transaction. The merchant names obviously 
-refer to the same business, and the dates are consistent.
+CONFIDENT — Clearly the same transaction.
+LIKELY — Probably the same transaction, but some ambiguity exists.
+UNCERTAIN — Not clear. The merchant names do not have an obvious connection.
 
-LIKELY — Probably the same transaction. The amount matches and the 
-merchant names are plausibly related, but there is some ambiguity 
-(e.g., abbreviation is not obvious, or date differs by more than 1 day).
-
-UNCERTAIN — Not clear. The merchant names do not have an obvious 
-connection, or there is another reason to doubt the match.
-
-Respond with ONLY a JSON object, no other text.
+Respond with ONLY a JSON object in this exact format, no other text:
+{"matches": [{"index": 0, "verdict": "confident", "reason": "..."}]}
 ```
 
-**Expected output:**
+**Return value:** List of dicts, one per candidate, in input order:
 ```json
-{
-  "verdict": "confident",
-  "reason": "CENCOSUD RETAIL SA is the corporate name for Wong supermarkets. Same amount, same date."
-}
+[
+  {"verdict": "confident", "reason": "CENCOSUD RETAIL SA is the corporate name for Wong supermarkets."}
+]
 ```
 
-**Multiple candidates:** When Python finds multiple logged transactions matching the same statement line amount and date range, the agent is called once per candidate. The bot then uses the verdicts to decide:
-- If exactly one candidate is Confident → auto-match
-- If no candidate is Confident but one or more are Likely → present options to user
-- If all are Uncertain → present all to user with context
-- If multiple are Confident → present to user (this should be rare and indicates a potential duplicate)
+**Verdict logic (applied by the bot after receiving results):**
+
+| Situation | Action |
+|-----------|--------|
+| Exactly one CONFIDENT candidate | Auto-confirm match |
+| No CONFIDENT but one or more LIKELY | Present options to user |
+| All UNCERTAIN | Present all to user with full context |
+| Multiple CONFIDENT | Present to user (indicates a potential duplicate) |
+| No candidates found | Prompt user to add or skip |
+
+Unknown verdict values from the model are coerced to `uncertain`.
 
 ---
 
@@ -249,38 +249,34 @@ The following logic is handled in Python, not by the agent.
 ### Payment Method Resolution
 
 When the agent returns a `payment_method_alias` (e.g., "sapphire"), the application:
-1. Searches the `payment_methods` table for a row where the alias appears in the `aliases` array (case-insensitive)
+1. Searches the in-memory payment method cache for a match in the `aliases` list (case-insensitive)
 2. If found, uses that payment method and its linked settlement account
 3. If not found, the bot asks the user to clarify
 
 ### Duplicate Detection
 
 Before saving a confirmed transaction, the application checks:
-1. Query for existing transactions with the same `amount`, `date`, and `payment_method_id`
+1. Query DynamoDB for transactions with the same `amount`, `date`, and `payment_method_id`
 2. If matches are found, the bot asks the user to confirm this is a distinct transaction
 
 ### Reconciliation Orchestration
 
-The reconciliation flow is coordinated by the application:
 1. User uploads a statement PDF and identifies the account
-2. Application calls the statement parser (Task 3) to extract lines
-3. Lines are stored in `statement_lines`
-4. For each statement line with a positive amount (debits only in MVP):
-   a. Query `transactions` for candidates: same amount, date within ±5 days, payment method settles to the same account
-   b. If no candidates → mark as unmatched, notify user
-   c. If candidates found → call agent (Task 4) for each candidate
-   d. Apply verdict logic (see Task 4 multiple candidates section)
-   e. Update `reconciliation_matches` and status fields
-5. Send summary to user via Telegram: X auto-matched, Y need review, Z unmatched
+2. `statement_parser.parse_statement_pdf()` extracts lines
+3. Lines are stored in DynamoDB (idempotent via content-hash IDs)
+4. For each pending statement line:
+   - Query via GSI1: same `account_id` + `amount_cents`, date within ±5 days
+   - If no candidates → mark `pending`, notify user
+   - If candidates found → call `reconciler.evaluate_matches(line, candidates)` once
+   - Apply verdict logic (see table above)
+   - Update statement line and transaction statuses in DynamoDB
+5. Send summary to user: X auto-matched, Y need review, Z unmatched
 
 ### Image Storage
 
-When the bot receives a photo:
-1. Download the image from Telegram using the file ID
-2. Save temporarily until the transaction is confirmed
-3. On confirmation, move to `storage/images/txn_{id}.jpg`
-4. Store the path in `transactions.image_path` and the Telegram file ID in `telegram_image_id`
-5. On cancellation, delete the temporary file
+1. Photo arrives → upload to `receipts/tmp/{user_id}.jpg` via `s3_store.upload_tmp_image()`
+2. Transaction confirmed → `s3_store.finalize_image()` copies to `receipts/{yyyy}/{mm}/txn_{id}.jpg`, deletes tmp
+3. Transaction cancelled → `s3_store.delete_tmp_image()` removes tmp object
 
 ---
 
@@ -292,16 +288,16 @@ When the bot receives a photo:
 
 **PDF parsing fails:** Notify the user that the statement could not be processed and suggest re-uploading or checking the file format.
 
-**Ollama is unreachable:** The bot informs the user that processing is temporarily unavailable and to try again shortly.
+**Bedrock service error:** The bot informs the user that processing is temporarily unavailable and to try again shortly.
 
 ---
 
 ## Prompt Evolution
 
-The prompts defined in this document are starting points. They should be refined based on real-world usage. Specifically:
+The prompts defined in this document are starting points. They should be refined based on real-world usage:
 
 - **Extraction accuracy:** If the agent consistently misreads a particular receipt format, the extraction prompt may need format-specific hints.
 - **Categorization accuracy:** If certain merchants are frequently miscategorized, the categorization prompt can include a merchant-to-category mapping as context.
-- **Reconciliation accuracy:** As the user processes more statements, common BCP merchant name patterns (corporate names vs. common names) can be added to the reconciliation prompt to improve matching.
+- **Reconciliation accuracy:** As the user processes more statements, common BCP merchant name patterns (corporate names vs. common names) can be added to the reconciliation prompt.
 
 All prompt changes should be tracked in version control alongside the application code.

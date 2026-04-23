@@ -2,58 +2,76 @@
 
 ## Overview
 
-All data is stored in a single PostgreSQL database. The schema is designed to be simple and flat — no deep nesting or complex relationships. There are six tables: three reference tables that hold configuration data, and three operational tables that hold transaction and reconciliation data.
-
-## Entity Relationship Diagram
-
-```
-┌──────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│   accounts   │     │ payment_methods   │     │   categories     │
-│──────────────│     │──────────────────│     │──────────────────│
-│ id           │◀─┐  │ id               │     │ id               │
-│ name         │  │  │ name             │     │ name             │
-│ bank         │  │  │ alias[]          │     │ slug             │
-│ currency     │  │  │ account_id (FK)  │──┘  └──────────────────┘
-│ type         │  │  └──────────────────┘              │
-└──────────────┘  │                                     │
-       ▲          │  ┌──────────────────┐              │
-       │          │  │  transactions    │              │
-       │          │  │──────────────────│              │
-       │          └──│ payment_method_id│              │
-       │             │ category_id (FK) │──────────────┘
-       │             │ amount           │
-       │             │ currency         │
-       │             │ date             │
-       │             │ merchant         │
-       │             │ ...              │
-       │             └──────────────────┘
-       │                      │
-       │                      │ (via reconciliation_matches)
-       │                      │
-       ▲             ┌──────────────────┐
-       │             │ statement_lines  │
-       │             │──────────────────│
-       └─────────────│ account_id (FK)  │
-                     │ amount           │
-                     │ description      │
-                     │ date             │
-                     │ ...              │
-                     └──────────────────┘
-```
+All data is stored in a single DynamoDB table (`finance-agent`) using a single-table design. Every entity type is distinguished by its `PK` and `SK` values. Two Global Secondary Indexes (GSI1, GSI2) cover access patterns that cannot be served by the primary key.
 
 ---
 
-## Reference Tables
+## Primary Key Structure
 
-### categories
+| Entity | PK | SK |
+|--------|----|----|
+| Atomic counter | `COUNTER` | `{name}` (e.g., `txn`) |
+| Reference data | `REF` | `CATEGORY#{slug}` / `ACCOUNT#{id:04d}` / `PM#{id:04d}` |
+| Transaction | `TXN` | `{date_iso}#{txn_id:08d}` |
+| Statement line | `STMT#{account_id}#{billing_period}` | `{date_iso}#{line_id}` |
+| Reconciliation match | `MATCH` | `STMT#{line_id}#TXN#{txn_id:08d}` |
+| User bot state | `STATE#{user_id}` | `current` |
 
-Static lookup table. Populated once at setup, rarely changes.
+---
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-increment ID |
-| name | VARCHAR(50) | NOT NULL, UNIQUE | Display name (e.g., "Food & Dining") |
-| slug | VARCHAR(30) | NOT NULL, UNIQUE | Lowercase key for code use (e.g., "food_dining") |
+## Global Secondary Indexes
+
+### GSI1 — Reconciliation candidate lookup
+
+Enables finding unreconciled transactions by settlement account and exact amount.
+
+| Key | Value |
+|-----|-------|
+| GSI1PK | `AMT#{account_id}#{amount_cents}` |
+| GSI1SK | `{date_iso}#{txn_id:08d}` |
+
+Query pattern: given a statement line with `account_id` and `amount`, find all transactions with matching account and amount within a date range.
+
+### GSI2 — Status-based transaction queries
+
+| Key | Value |
+|-----|-------|
+| GSI2PK | `STATUS#TXN#{reconciliation_status}` |
+| GSI2SK | `{date_iso}#{txn_id:08d}` |
+
+Query pattern: find all unreconciled (or reconciled) transactions across all dates.
+
+---
+
+## Entity Definitions
+
+### COUNTER
+
+Atomic auto-increment counter. Used for transaction IDs.
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| PK | S | `COUNTER` |
+| SK | S | Counter name (e.g., `txn`) |
+| value | N | Current counter value |
+
+Incremented atomically with `UpdateItem ADD value :1 RETURN UPDATED_NEW`.
+
+---
+
+### REF — Reference Data
+
+All reference data shares `PK = REF`. Loaded once per Lambda cold start and cached in memory.
+
+#### CATEGORY
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| PK | S | `REF` |
+| SK | S | `CATEGORY#{slug}` |
+| id | N | Integer category ID |
+| name | S | Display name (e.g., "Food & Dining") |
+| slug | S | Code-friendly key (e.g., `food_dining`) |
 
 **Seed data:**
 
@@ -65,24 +83,26 @@ Static lookup table. Populated once at setup, rarely changes.
 | 4 | Housing | housing |
 | 5 | Utilities | utilities |
 | 6 | Health | health |
-| 7 | Entertainment | entertainment |
-| 8 | Shopping | shopping |
-| 9 | Education | education |
-| 10 | Other | other |
+| 7 | Personal Care | personal_care |
+| 8 | Entertainment | entertainment |
+| 9 | Shopping | shopping |
+| 10 | Education | education |
+| 11 | Work | work |
+| 12 | Other | other |
 
-### accounts
+#### ACCOUNT
 
-Represents bank accounts and credit cards that appear on bank statements. Each account maps to one statement source.
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| PK | S | `REF` |
+| SK | S | `ACCOUNT#{id:04d}` |
+| id | N | Integer account ID |
+| name | S | Display name |
+| bank | S | Bank name |
+| currency | S | `PEN` or `USD` |
+| type | S | `credit_card` or `current_account` |
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-increment ID |
-| name | VARCHAR(100) | NOT NULL, UNIQUE | Display name |
-| bank | VARCHAR(50) | NOT NULL | Bank name |
-| currency | VARCHAR(3) | NOT NULL | PEN or USD |
-| type | VARCHAR(20) | NOT NULL | "credit_card" or "current_account" |
-
-**Seed data (MVP):**
+**Seed data:**
 
 | id | name | bank | currency | type |
 |----|------|------|----------|------|
@@ -91,97 +111,128 @@ Represents bank accounts and credit cards that appear on bank statements. Each a
 | 3 | Soles Current Account | BCP | PEN | current_account |
 | 4 | Dollars Current Account | BCP | USD | current_account |
 
-### payment_methods
+#### PAYMENT METHOD (PM)
 
-Represents how the user pays. Each payment method settles to a specific account (which determines where it appears on a bank statement).
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| PK | S | `REF` |
+| SK | S | `PM#{id:04d}` |
+| id | N | Integer payment method ID |
+| name | S | Display name |
+| aliases | L | List of alias strings (lowercase) |
+| account_id | N | Settlement account ID (absent for Cash) |
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-increment ID |
-| name | VARCHAR(100) | NOT NULL, UNIQUE | Display name |
-| aliases | TEXT[] | NOT NULL, DEFAULT '{}' | Shorthand names the user can type in Telegram |
-| account_id | INTEGER | FOREIGN KEY → accounts(id), NULLABLE | Settlement account. NULL for cash. |
-
-**Seed data (MVP):**
+**Seed data:**
 
 | id | name | aliases | account_id |
 |----|------|---------|------------|
-| 1 | BCP Visa Infinite Sapphire | {sapphire, sap, visa} | 1 |
-| 2 | BCP Amex Platinum | {amex, platinum} | 2 |
-| 3 | Yape | {yape} | 3 |
-| 4 | BCP Transfer (Soles) | {transfer, bcp} | 3 |
-| 5 | BCP Transfer (Dollars) | {usd, dollars} | 4 |
-| 6 | Cash | {cash, efectivo} | NULL |
+| 1 | BCP Visa Infinite Sapphire | sapphire, sap, visa | 1 |
+| 2 | BCP Amex Platinum | amex, platinum | 2 |
+| 3 | Yape | yape | 3 |
+| 4 | BCP Transfer (Soles) | transfer, bcp | 3 |
+| 5 | BCP Transfer (Dollars) | usd, dollars | 4 |
+| 6 | Cash | cash, efectivo | — |
 
 ---
 
-## Operational Tables
+### TXN — Transactions
 
-### transactions
+One item per confirmed transaction.
 
-The core table. One row per confirmed transaction.
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| PK | S | `TXN` |
+| SK | S | `{date_iso}#{txn_id:08d}` |
+| GSI1PK | S | `AMT#{account_id}#{amount_cents}` |
+| GSI1SK | S | `{date_iso}#{txn_id:08d}` |
+| GSI2PK | S | `STATUS#TXN#{reconciliation_status}` |
+| GSI2SK | S | `{date_iso}#{txn_id:08d}` |
+| id | N | Integer transaction ID (from COUNTER) |
+| amount | N (Decimal) | Transaction amount |
+| amount_cents | N | Amount × 100 as integer (used in GSI1PK) |
+| currency | S | `PEN` or `USD` |
+| date | S | `YYYY-MM-DD` |
+| merchant | S | Merchant or payee name |
+| description | S | Free-text notes |
+| category_id | N | Category reference |
+| category_slug | S | Category slug |
+| category_name | S | Category display name |
+| payment_method_id | N | Payment method reference |
+| payment_method_name | S | Payment method display name |
+| account_id | N | Settlement account ID (absent for Cash) |
+| telegram_image_id | S | Telegram file ID (secondary reference) |
+| image_path | S | S3 key (`receipts/{yyyy}/{mm}/txn_{id}.jpg`) |
+| reconciliation_status | S | `reconciled` or `unreconciled` |
+| created_at | S | ISO 8601 timestamp |
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-increment ID |
-| amount | DECIMAL(12,2) | NOT NULL | Transaction amount |
-| currency | VARCHAR(3) | NOT NULL | PEN or USD |
-| date | DATE | NOT NULL | Transaction date |
-| merchant | VARCHAR(200) | | Merchant or payee name (as extracted) |
-| description | TEXT | | Free-text notes (mandatory when category is Other) |
-| category_id | INTEGER | NOT NULL, FOREIGN KEY → categories(id) | Spending category |
-| payment_method_id | INTEGER | NOT NULL, FOREIGN KEY → payment_methods(id) | How the user paid |
-| telegram_image_id | VARCHAR(200) | | Telegram file ID (secondary reference) |
-| image_path | VARCHAR(300) | | Local file path to the saved receipt/screenshot image |
-| reconciliation_status | VARCHAR(20) | NOT NULL, DEFAULT 'unreconciled' | "reconciled" or "unreconciled" |
-| created_at | TIMESTAMP | NOT NULL, DEFAULT NOW() | When the record was created |
+**Notes:**
+- `account_id` is absent for Cash transactions. Cash transactions are never candidates for reconciliation.
+- `image_path` is populated after the receipt image is finalized in S3.
+- GSI key values are updated atomically when `reconciliation_status` changes (requires a new item write in DynamoDB; status is stored in the key itself in GSI2PK).
 
-**Index:** `(amount, date, payment_method_id)` — used for duplicate detection and reconciliation candidate filtering.
+---
 
-### statement_lines
+### STMT — Statement Lines
 
-Rows extracted from bank statement PDFs. One row per line item on a statement.
+Items extracted from bank statement PDFs. Grouped by account and billing period.
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-increment ID |
-| account_id | INTEGER | NOT NULL, FOREIGN KEY → accounts(id) | Which account this statement belongs to |
-| billing_period | VARCHAR(7) | NOT NULL | Year-month of the statement (e.g., "2026-04") |
-| date | DATE | NOT NULL | Transaction date as shown on statement |
-| description | VARCHAR(300) | NOT NULL | Merchant/description as shown on statement |
-| amount | DECIMAL(12,2) | NOT NULL | Amount (positive = debit/charge) |
-| reconciliation_status | VARCHAR(20) | NOT NULL, DEFAULT 'pending' | "matched", "added", "skipped", or "pending" |
-| created_at | TIMESTAMP | NOT NULL, DEFAULT NOW() | When the record was imported |
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| PK | S | `STMT#{account_id}#{billing_period}` |
+| SK | S | `{date_iso}#{line_id}` |
+| id | S | Content hash (blake2b 6-byte digest, hex) |
+| account_id | N | Settlement account ID |
+| billing_period | S | `YYYY-MM` |
+| date | S | `YYYY-MM-DD` |
+| description | S | Merchant/description as shown on statement |
+| amount | N (Decimal) | Charge amount (positive = debit) |
+| amount_cents | N | Amount × 100 as integer |
+| reconciliation_status | S | `pending`, `matched`, `added`, or `skipped` |
+| created_at | S | ISO 8601 timestamp |
 
-**Index:** `(account_id, amount, date)` — used for reconciliation candidate lookup.
+**ID generation:** `blake2b(f"{account_id}|{billing_period}|{date}|{description}|{amount_cents}", digest_size=6).hexdigest()`. This makes re-importing the same statement idempotent — duplicate lines are rejected by `ConditionExpression="attribute_not_exists(PK)"`.
 
-**Unique constraint:** `(account_id, billing_period, date, description, amount)` — prevents importing the same statement twice.
+---
 
-### reconciliation_matches
+### MATCH — Reconciliation Matches
 
-Join table linking statement lines to transactions. Created during reconciliation.
+Links a statement line to a transaction. Created during reconciliation.
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-increment ID |
-| statement_line_id | INTEGER | NOT NULL, FOREIGN KEY → statement_lines(id), UNIQUE | One statement line matches at most one transaction |
-| transaction_id | INTEGER | NOT NULL, FOREIGN KEY → transactions(id), UNIQUE | One transaction matches at most one statement line |
-| verdict | VARCHAR(20) | NOT NULL | "confident", "likely", or "uncertain" |
-| confirmed_by | VARCHAR(20) | NOT NULL | "auto" or "user" |
-| created_at | TIMESTAMP | NOT NULL, DEFAULT NOW() | When the match was created |
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| PK | S | `MATCH` |
+| SK | S | `STMT#{line_id}#TXN#{txn_id:08d}` |
+| statement_line_id | S | Statement line content hash |
+| transaction_id | N | Transaction integer ID |
+| verdict | S | `confident`, `likely`, or `uncertain` |
+| confirmed_by | S | `auto` or `user` |
+| created_at | S | ISO 8601 timestamp |
 
-**Constraint:** Both `statement_line_id` and `transaction_id` are UNIQUE, enforcing a strict one-to-one relationship. A statement line cannot be matched to multiple transactions and vice versa.
+---
+
+### STATE — User Bot State
+
+Stores per-user conversation state for the Telegram bot. Auto-expires after inactivity.
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| PK | S | `STATE#{user_id}` |
+| SK | S | `current` |
+| state | S | JSON-serialized state dict |
+| ttl | N | Unix timestamp; DynamoDB TTL deletes item after expiry |
+
+TTL is set to `now + USER_STATE_TTL_SECONDS` (default: 3600) on every write. Expired items are deleted by DynamoDB automatically — no cleanup needed.
 
 ---
 
 ## Notes
 
-**Currency is stored on the transaction, not derived from the account.** While BCP soles account transactions are almost always in PEN, storing the currency explicitly on each transaction avoids assumptions and keeps the data self-describing.
+**Currency is stored on the transaction, not derived from the account.** Storing currency explicitly on each transaction avoids assumptions and keeps records self-describing.
 
-**Cash transactions have no settlement account.** The payment method "Cash" has a NULL `account_id`, so cash transactions are never included in reconciliation. Their `reconciliation_status` stays "unreconciled" permanently, which is correct — there is no statement to reconcile against.
+**Cash transactions have no settlement account.** The payment method "Cash" has no `account_id`, so cash transactions are never included in reconciliation. Their `reconciliation_status` stays `unreconciled` permanently.
 
-**The `Other` category requires a description.** This is enforced at the application level, not the database level. When the agent assigns the Other category, it must ensure the description field is populated (either from the user's message or by asking).
+**The `Other` category requires a description.** Enforced at the application level. When the agent assigns the Other category, it ensures the description field is populated.
 
-**Statement credits are skipped in the MVP.** Salary deposits, reimbursements, and payments from friends will appear as statement lines during reconciliation. The user skips them, and their status is set to "skipped". Credit tracking is planned for v2.
+**Statement credits are skipped.** Salary deposits, reimbursements, and payments from friends appear as statement lines but are skipped by the user during reconciliation. Their status is set to `skipped`.
 
-**Images are stored locally, not just referenced.** When the user sends a photo via Telegram, the bot downloads it and saves it to `storage/images/` with the naming convention `txn_{id}.jpg`. The local file path is stored in `image_path`. The `telegram_image_id` is kept as a secondary reference but the local copy is the source of truth — Telegram file IDs can expire over time. Images can be viewed from the Streamlit dashboard alongside their linked transaction and, through reconciliation_matches, alongside the corresponding statement line.
+**Images are stored in S3, not locally.** Receipt images follow a tmp→final copy pattern via `s3_store.py`. The `image_path` attribute on a transaction holds the S3 object key (`receipts/{yyyy}/{mm}/txn_{id}.jpg`).

@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the features of the Personal Finance Agent MVP, organized by user flow. Each feature includes what it does, how the user interacts with it, and the expected behavior.
+This document describes the features of the Personal Finance Agent, organized by user flow. Each feature includes what it does, how the user interacts with it, and the expected behavior.
 
 ---
 
@@ -19,10 +19,11 @@ The most common input method. The user sends a photo (receipt, transfer screensh
 - A message like "Sapphire, groceries"
 
 **Agent does:**
-1. Extracts from the image: merchant name, amount, date, currency
+1. Extracts from the image: merchant name, amount, date, currency (Claude Sonnet 4.6 via Bedrock)
 2. Parses the message: payment method (Sapphire) and category hint (groceries)
 3. Maps payment method to settlement account (Sapphire → Sapphire credit card statement)
-4. Maps category hint to standard category (groceries → Groceries)
+4. Maps category hint to standard category (groceries → Groceries) (Claude Haiku 4.5 via Bedrock)
+5. Uploads the receipt image to S3 at a temporary key
 
 **Bot replies with confirmation:**
 ```
@@ -33,15 +34,15 @@ The most common input method. The user sends a photo (receipt, transfer screensh
   Currency:  PEN
   Category:  Groceries
   Paid with: BCP Visa Infinite Sapphire
-  
+
   ✅ Confirm    ✏️ Edit    ❌ Cancel
 ```
 
-**User confirms:** Transaction is saved.
+**User confirms:** Transaction is saved to DynamoDB; receipt image is moved to its permanent S3 key.
 
 **User edits:** Bot asks which field to correct. User provides the correction, bot shows updated summary, user confirms.
 
-**User cancels:** Transaction is discarded.
+**User cancels:** Transaction is discarded; temporary S3 image is deleted.
 
 ### 1.2 Text-Only Message
 
@@ -66,10 +67,10 @@ When the agent cannot confidently extract a field, it asks rather than guesses.
 **Examples:**
 - Image is blurry or unreadable → "I couldn't read this receipt clearly. Can you tell me the merchant, amount, and date?"
 - No payment method provided → "Which card or account did you use for this?"
-- Category is unclear → "How would you categorize this?" (presents the 10 categories as buttons)
+- Category is unclear → "How would you categorize this?" (presents the 12 categories as buttons)
 - Amount found but currency ambiguous → "Is this S/. 45.00 or $45.00?"
 
-The agent should never store a transaction with fabricated data. Missing fields are always asked for.
+The agent never stores a transaction with fabricated data. Missing fields are always asked for.
 
 ### 1.4 Supported Input Formats
 
@@ -84,7 +85,7 @@ The agent should never store a transaction with fabricated data. Missing fields 
 
 ## 2. Transaction Storage
 
-All confirmed transactions are stored in PostgreSQL with the full set of structured fields defined in [DATA_MODEL.md](DATA_MODEL.md).
+All confirmed transactions are stored in DynamoDB with the full set of structured fields defined in [DATA_MODEL.md](DATA_MODEL.md). Receipt images are stored in S3.
 
 ### 2.1 Required Fields
 
@@ -100,7 +101,7 @@ Every transaction must have these fields before it can be saved:
 These are captured when available but not required:
 - Merchant name
 - Description / notes
-- Original image reference (file ID from Telegram)
+- Receipt image (stored in S3; key saved in `image_path`)
 
 ### 2.3 Duplicate Prevention
 
@@ -117,30 +118,29 @@ At the end of each billing cycle, the user uploads bank statement PDFs for each 
 **User sends:** A PDF file to the Telegram bot with a message identifying the account (e.g., "Sapphire statement April").
 
 **Agent does:**
-1. Parses the PDF to extract individual statement lines (date, description, amount)
+1. Parses the PDF with `pdfplumber` to extract individual statement lines (date, description, amount)
 2. Identifies the account from the user's message
-3. Stores the statement lines in the database linked to the correct account and billing period
+3. Stores the statement lines in DynamoDB (idempotent — re-uploading the same statement is safe)
 
 ### 3.2 Matching Process
 
 Reconciliation runs in two stages:
 
 **Stage 1 — Python pre-filter:**
-- For each statement line, find logged transactions with the same exact amount in the same settlement account
-- Narrow candidates by date proximity (statement date ±5 days of logged transaction date, to account for posting delays)
-- If exactly one candidate is found, pass it to the agent for evaluation
-- If multiple candidates are found, pass all to the agent
-- If no candidates are found, flag the statement line as unmatched
+- For each statement line, query DynamoDB via GSI1 for transactions with the same exact amount and settlement account within ±5 days of the statement date
+- If no candidates are found, flag the statement line as pending
+- If candidates are found, pass all of them to the agent in a single batched call
 
-**Stage 2 — Agent evaluation:**
-- For each candidate pair (statement line ↔ logged transaction), the agent evaluates semantic similarity of merchant names and context
-- The agent assigns a verdict:
+**Stage 2 — Agent evaluation (batched):**
+- The agent receives the statement line and all candidates at once
+- It assigns a verdict to each candidate: Confident, Likely, or Uncertain
+- One Bedrock call per statement line, regardless of how many candidates exist
 
 | Verdict | Meaning | Action |
 |---------|---------|--------|
-| **Confident** | Clearly the same transaction — exact amount, obviously same merchant, consistent date | Auto-confirmed |
-| **Likely** | Probably the same — exact amount, plausible merchant name variation, minor date difference | Sent to user for quick yes/no confirmation |
-| **Uncertain** | Unclear — ambiguous merchant match, multiple possible candidates, or no reasonable match | Sent to user with context for manual review |
+| **Confident** | Clearly the same transaction | Auto-confirmed |
+| **Likely** | Probably the same | Sent to user for quick yes/no confirmation |
+| **Uncertain** | Unclear match | Sent to user with context for manual review |
 
 ### 3.3 Reconciliation Review via Telegram
 
@@ -194,16 +194,21 @@ Every logged transaction has one of these statuses:
 
 ## 4. Dashboard
 
-A Streamlit application providing real-time visibility into personal finances. Accessible locally at `localhost:8501`.
+A local Streamlit application providing real-time visibility into personal finances. Reads from DynamoDB — requires AWS credentials in the environment.
+
+```bash
+export AWS_PROFILE=your-profile AWS_REGION=us-east-1
+streamlit run dashboard/app.py
+```
 
 ### 4.1 Monthly Summary
 
-The default view. Shows the current month's spending:
+The default view. Shows spending for a selected month:
 - Total spent (PEN and USD shown separately)
-- Spending by category (bar chart)
-- Spending by payment method (bar chart)
+- Comparison to the previous month
 - Number of transactions
-- Comparison to previous month
+- Spending by category (horizontal bar chart)
+- Spending by payment method (horizontal bar chart)
 
 ### 4.2 Category Breakdown
 
@@ -212,16 +217,17 @@ Drill down into any category to see individual transactions. Filterable by date 
 ### 4.3 Trends
 
 Monthly spending over time:
-- Total spending per month (line chart)
-- Per-category trends
+- Total spending per month (line chart, by currency)
+- Per-category trends (line chart)
 - Selectable date range
 
 ### 4.4 Reconciliation Status
 
 Overview of reconciliation health:
-- Transactions reconciled vs. unreconciled per month
-- Statement lines matched vs. unmatched per statement
-- List of pending review items (with links to resolve via Telegram)
+- Reconciled vs. unreconciled transaction counts for the selected month
+- Statement line counts by status (matched, added, skipped, pending)
+- List of pending statement lines (date, description, amount, account)
+- List of unreconciled transactions (date, merchant, amount, payment method)
 
 ---
 
@@ -238,19 +244,18 @@ To minimize typing, the bot recognizes short aliases for payment methods:
 | `usd`, `dollars` | BCP direct transfer (dollars) |
 | `cash`, `efectivo` | Cash (no reconciliation) |
 
-The agent recognizes these in any position within the message and is case-insensitive. Aliases can be extended by the user over time.
+The agent recognizes these in any position within the message and is case-insensitive.
 
 ---
 
-## Features NOT in MVP
+## Features NOT Included
 
-The following are explicitly out of scope for the MVP:
-- Income and credit tracking (salary, reimbursements, payments from friends — statement credits are skipped during reconciliation for now, planned for v2)
+The following are explicitly out of scope:
+- Income and credit tracking (salary, reimbursements — statement credits are skipped during reconciliation)
 - Budget setting and tracking
 - Automated spending alerts or notifications
 - Multi-user support
-- Income tracking (only expenses are tracked)
 - FX conversion between PEN and USD
 - Recurring transaction detection
 - Bank API integration
-- Cloud deployment
+- Additional banks (Interbank, BBVA, Cencosud Scotiabank) — BCP only for now
