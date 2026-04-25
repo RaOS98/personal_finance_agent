@@ -17,24 +17,24 @@ CATEGORIES = [
 ]
 
 
-def confirmation_keyboard() -> InlineKeyboardMarkup:
+def confirmation_keyboard(prefix: str = "txn") -> InlineKeyboardMarkup:
     buttons = [
         [
-            InlineKeyboardButton("✅ Confirm", callback_data="txn_confirm"),
-            InlineKeyboardButton("✏️ Edit", callback_data="txn_edit"),
-            InlineKeyboardButton("❌ Cancel", callback_data="txn_cancel"),
+            InlineKeyboardButton("✅ Confirm", callback_data=f"{prefix}_confirm"),
+            InlineKeyboardButton("✏️ Edit", callback_data=f"{prefix}_edit"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"{prefix}_cancel"),
         ]
     ]
     return InlineKeyboardMarkup(buttons)
 
 
-def edit_field_keyboard() -> InlineKeyboardMarkup:
+def edit_field_keyboard(prefix: str = "edit") -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton("Merchant", callback_data="edit_merchant")],
-        [InlineKeyboardButton("Amount", callback_data="edit_amount")],
-        [InlineKeyboardButton("Date", callback_data="edit_date")],
-        [InlineKeyboardButton("Category", callback_data="edit_category")],
-        [InlineKeyboardButton("Payment Method", callback_data="edit_payment_method")],
+        [InlineKeyboardButton("Merchant", callback_data=f"{prefix}_merchant")],
+        [InlineKeyboardButton("Amount", callback_data=f"{prefix}_amount")],
+        [InlineKeyboardButton("Date", callback_data=f"{prefix}_date")],
+        [InlineKeyboardButton("Category", callback_data=f"{prefix}_category")],
+        [InlineKeyboardButton("Payment Method", callback_data=f"{prefix}_payment_method")],
     ]
     return InlineKeyboardMarkup(buttons)
 
