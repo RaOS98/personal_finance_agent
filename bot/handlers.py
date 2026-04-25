@@ -14,7 +14,7 @@ import s3_store
 from agent import (
     extractor,
     categorizer,
-    reconciler,
+    reconciliation as reconciliation_agent,
     statement_parser,
     intent_classifier,
     tx_editor,
@@ -906,7 +906,8 @@ async def _save_transaction(query, state: dict, user_id: int) -> None:
             logger.exception("Failed to finalize image for txn %s", txn_id)
 
     _mark_cleared(state)
-    await query.edit_message_text(f"✅ Transaction saved! (ID: {txn_id})")
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(f"✅ Transaction saved! (ID: {txn_id})")
 
 
 # ---------------------------------------------------------------------------
@@ -1002,6 +1003,16 @@ async def _handle_document_inner(
     file = await context.bot.get_file(document.file_id)
     pdf_bytes = bytes(await file.download_as_bytearray())
 
+    pdf_s3_key: str | None = None
+    try:
+        pdf_s3_key = s3_store.upload_statement_pdf(
+            account_id=account_id,
+            billing_period=billing_period,
+            pdf_bytes=pdf_bytes,
+        )
+    except Exception:
+        logger.exception("Failed to archive statement PDF to S3")
+
     try:
         lines = statement_parser.parse_statement_pdf(pdf_bytes)
     except Exception:
@@ -1017,7 +1028,12 @@ async def _handle_document_inner(
         return
 
     try:
-        db.save_statement_lines(account_id, billing_period, lines)
+        db.save_statement_lines(
+            account_id,
+            billing_period,
+            lines,
+            pdf_s3_key=pdf_s3_key,
+        )
     except Exception:
         logger.exception("Failed to save statement lines")
         await update.message.reply_text(
@@ -1036,10 +1052,6 @@ async def _handle_document_inner(
 # Reconciliation orchestration (batched LLM calls)
 # ---------------------------------------------------------------------------
 
-def _reconciliation_verdict(row: dict) -> str:
-    return str(row.get("verdict") or "uncertain").strip().lower()
-
-
 async def run_reconciliation(
     account_id: int,
     billing_period: str,
@@ -1047,84 +1059,31 @@ async def run_reconciliation(
     state: dict,
     user_id: int,
 ) -> None:
-    pending_lines = db.get_pending_statement_lines(account_id, billing_period)
+    """Drive the auto-match loop and hand Telegram users the review queue."""
+    result = reconciliation_agent.auto_reconcile(
+        account_id=account_id,
+        billing_period=billing_period,
+    )
 
-    auto_matched = 0
-    needs_review: list[dict] = []
-    unmatched: list[dict] = []
+    auto_matched = result["auto_matched"]
+    needs_review = result["needs_review"]
+    unmatched_entries = result["unmatched"]
 
-    for line in pending_lines:
-        if float(line["amount"]) <= 0:
-            db.update_statement_line_status(line["id"], "skipped")
-            continue
-
-        candidates = db.find_reconciliation_candidates(
-            account_id=account_id,
-            amount=line["amount"],
-            date_val=_coerce_txn_date(line["date"]),
-            tolerance_days=config.RECONCILIATION_DATE_TOLERANCE_DAYS,
-        )
-
-        if not candidates:
-            unmatched.append(line)
-            continue
-
-        # Batched evaluation — one LLM call per statement line, not per candidate.
-        try:
-            verdicts = reconciler.evaluate_matches(
-                statement_line={
-                    "date": str(line["date"]),
-                    "description": line["description"],
-                    "amount": float(line["amount"]),
-                },
-                candidates=[
-                    {
-                        "date": str(c["date"]),
-                        "merchant": c.get("merchant", ""),
-                        "amount": float(c["amount"]),
-                        "category": c.get("category_name", ""),
-                    }
-                    for c in candidates
-                ],
-            )
-        except Exception:
-            logger.exception("Reconciliation evaluation failed")
-            verdicts = [{"verdict": "uncertain", "reason": "Evaluation error"} for _ in candidates]
-
-        for c, v in zip(candidates, verdicts):
-            c["verdict"] = str(v.get("verdict") or "uncertain").strip().lower()
-            c["reason"] = v.get("reason", "")
-
-        confident = [c for c in candidates if _reconciliation_verdict(c) == "confident"]
-        likely = [c for c in candidates if _reconciliation_verdict(c) == "likely"]
-
-        if len(confident) == 1:
-            match = confident[0]
-            db.save_reconciliation_match(
-                statement_line_id=line["id"],
-                transaction_id=int(match["id"]),
-                verdict="confident",
-                confirmed_by="auto",
-            )
-            auto_matched += 1
-        elif confident or likely:
-            needs_review.append({"line": line, "candidates": candidates})
-        else:
-            needs_review.append({"line": line, "candidates": candidates})
+    unmatched_lines = [entry["line"] for entry in unmatched_entries]
 
     summary = (
         f"Reconciliation complete:\n"
-        f"  ✅ Auto-matched: {auto_matched}\n"
+        f"  ✅ Auto-matched: {len(auto_matched)}\n"
         f"  🔍 Need review: {len(needs_review)}\n"
-        f"  ❓ Unmatched: {len(unmatched)}"
+        f"  ❓ Unmatched: {len(unmatched_lines)}"
     )
     await update.message.reply_text(summary)
 
-    if needs_review or unmatched:
+    if needs_review or unmatched_lines:
         state["state"] = "reconciliation_review"
         state["recon"] = {
             "review_queue": needs_review,
-            "unmatched_queue": unmatched,
+            "unmatched_queue": unmatched_lines,
             "current_line": None,
             "current_candidates": None,
         }

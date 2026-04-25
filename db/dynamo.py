@@ -17,6 +17,7 @@ Global secondary indexes:
 
     GSI1  AMT#{account_id}#{amount_cents}  {date}#{txn_id:08d}    transaction-by-amount
     GSI2  STATUS#TXN#{status}              {date}#{txn_id:08d}    transaction-by-status
+    GSI3  LINE#{line_id}                   (no SK)                statement-line-by-id
 
 Function signatures mirror the previous ``db.queries`` module so callers need
 minimal changes.
@@ -83,7 +84,7 @@ def _normalize_item(item: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     cleaned: dict[str, Any] = {}
     for k, v in item.items():
-        if k in {"PK", "SK", "GSI1PK", "GSI1SK", "GSI2PK", "GSI2SK", "ttl"}:
+        if k in {"PK", "SK", "GSI1PK", "GSI1SK", "GSI2PK", "GSI2SK", "GSI3PK", "ttl"}:
             continue
         cleaned[k] = _normalize_value(v)
     return cleaned
@@ -531,8 +532,13 @@ def save_statement_lines(
     account_id: int,
     billing_period: str,
     lines: list[dict[str, Any]],
+    pdf_s3_key: str | None = None,
 ) -> int:
-    """Idempotent bulk insert. Returns the number of NEW rows inserted."""
+    """Idempotent bulk insert. Returns the number of NEW rows inserted.
+
+    If ``pdf_s3_key`` is supplied, every newly-inserted line stores the key so
+    the dashboard can render a presigned link back to the original PDF.
+    """
     inserted = 0
     for line in lines:
         date_iso = _iso(line["date"])
@@ -545,9 +551,10 @@ def save_statement_lines(
         sk = f"{date_iso}#{line_id}"
         created_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-        item = {
+        item: dict[str, Any] = {
             "PK": pk,
             "SK": sk,
+            "GSI3PK": f"LINE#{line_id}",
             "id": line_id,
             "account_id": int(account_id),
             "billing_period": billing_period,
@@ -558,6 +565,8 @@ def save_statement_lines(
             "reconciliation_status": "pending",
             "created_at": created_at,
         }
+        if pdf_s3_key:
+            item["pdf_s3_key"] = pdf_s3_key
 
         try:
             _table.put_item(
@@ -599,14 +608,39 @@ def update_statement_line_status(statement_line_id: str, status: str) -> None:
 
 
 def _get_statement_line(line_id: str) -> dict[str, Any] | None:
-    """Scan-based lookup by line id. Volume is small (~80 lines/month)."""
-    # The line_id is the SK suffix after "{date}#"; we scan to locate it.
-    resp = _table.scan(
-        FilterExpression=Attr("id").eq(line_id) & Attr("PK").begins_with("STMT#"),
-    )
-    items = resp.get("Items", [])
+    """Look up a statement line by id.
+
+    Tries the dedicated GSI3 (``GSI3PK = LINE#{line_id}``) first because each
+    line has a unique partition there; falls back to a full-table scan for
+    legacy items that were written before GSI3 existed.
+    """
+    try:
+        resp = _table.query(
+            IndexName="GSI3",
+            KeyConditionExpression=Key("GSI3PK").eq(f"LINE#{line_id}"),
+            Limit=1,
+        )
+        items = resp.get("Items", [])
+    except ClientError as exc:
+        # GSI3 not yet deployed in this environment. Fall back to scan and log
+        # so we notice during the migration window.
+        if exc.response["Error"]["Code"] in {
+            "ValidationException",
+            "ResourceNotFoundException",
+        }:
+            logger.debug("GSI3 unavailable, falling back to scan: %s", exc)
+            items = []
+        else:
+            raise
+
     if not items:
-        return None
+        resp = _table.scan(
+            FilterExpression=Attr("id").eq(line_id) & Attr("PK").begins_with("STMT#"),
+        )
+        items = resp.get("Items", [])
+        if not items:
+            return None
+
     raw = items[0]
     result = _normalize_item(raw)
     result["_pk"] = raw["PK"]
@@ -641,6 +675,50 @@ def save_reconciliation_match(
     update_statement_line_status(statement_line_id, "matched")
     update_transaction_reconciliation_status(int(transaction_id), "reconciled")
     return _normalize_item(item)
+
+
+def delete_reconciliation_match(
+    statement_line_id: str,
+    transaction_id: int,
+) -> bool:
+    """Remove a match and flip both sides back to their pre-match statuses.
+
+    Returns True if a match row was deleted, False if no match was found
+    (still re-asserts the pending/unreconciled statuses for safety).
+    """
+    sk = f"STMT#{statement_line_id}#TXN#{int(transaction_id):08d}"
+    deleted = False
+    try:
+        _table.delete_item(
+            Key={"PK": "MATCH", "SK": sk},
+            ConditionExpression="attribute_exists(PK)",
+        )
+        deleted = True
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+
+    update_statement_line_status(statement_line_id, "pending")
+    update_transaction_reconciliation_status(int(transaction_id), "unreconciled")
+    return deleted
+
+
+def list_matches_for_line(statement_line_id: str) -> list[dict[str, Any]]:
+    """Return the match rows pointing at a given statement line, if any."""
+    resp = _table.query(
+        KeyConditionExpression=Key("PK").eq("MATCH")
+        & Key("SK").begins_with(f"STMT#{statement_line_id}#"),
+    )
+    return [_normalize_item(i) for i in resp.get("Items", [])]
+
+
+def list_matches_for_transaction(transaction_id: int) -> list[dict[str, Any]]:
+    """Return the match rows pointing at a given transaction id."""
+    resp = _table.scan(
+        FilterExpression=Attr("PK").eq("MATCH")
+        & Attr("transaction_id").eq(int(transaction_id)),
+    )
+    return [_normalize_item(i) for i in resp.get("Items", [])]
 
 
 # ---------------------------------------------------------------------------

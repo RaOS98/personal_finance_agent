@@ -1,8 +1,9 @@
-"""Thin S3 helpers for receipt images."""
+"""Thin S3 helpers for receipt images and statement PDFs."""
 
 from __future__ import annotations
 
 import logging
+from uuid import uuid4
 
 import boto3
 from botocore.exceptions import ClientError
@@ -61,3 +62,34 @@ def presigned_url(key: str, ttl: int = 3600) -> str:
         Params={"Bucket": config.S3_BUCKET, "Key": key},
         ExpiresIn=ttl,
     )
+
+
+# ---------------------------------------------------------------------------
+# Statement PDFs
+# ---------------------------------------------------------------------------
+
+def upload_statement_pdf(
+    account_id: int,
+    billing_period: str,
+    pdf_bytes: bytes,
+) -> str:
+    """Upload a bank statement PDF and return its S3 key.
+
+    Each upload gets a fresh UUID-suffixed key so re-uploading the same
+    statement (after fixing parser bugs, for example) does not overwrite the
+    previous copy. Statement lines store this key on insert so the dashboard
+    can render a presigned link back to the source document.
+    """
+    key = f"statements/{int(account_id)}/{billing_period}/{uuid4().hex}.pdf"
+    _s3.put_object(
+        Bucket=config.S3_BUCKET,
+        Key=key,
+        Body=pdf_bytes,
+        ContentType="application/pdf",
+    )
+    return key
+
+
+def statement_pdf_url(key: str, ttl: int = 3600) -> str:
+    """Presigned GET URL for a previously-uploaded statement PDF."""
+    return presigned_url(key, ttl)

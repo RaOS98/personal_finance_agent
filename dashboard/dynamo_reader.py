@@ -49,16 +49,18 @@ def _query_all(**kwargs) -> list[dict]:
     return items
 
 
+_TXN_COLUMNS = [
+    "id", "date", "merchant", "description", "amount",
+    "currency", "category_name", "category_slug",
+    "payment_method_name", "payment_method_id",
+    "reconciliation_status", "account_id", "image_path",
+]
+
+
 def _fetch_all_transactions() -> pd.DataFrame:
     items = _query_all(KeyConditionExpression=Key("PK").eq("TXN"))
     if not items:
-        return pd.DataFrame(
-            columns=[
-                "id", "date", "merchant", "description", "amount",
-                "currency", "category_name", "payment_method_name",
-                "reconciliation_status", "account_id",
-            ]
-        )
+        return pd.DataFrame(columns=_TXN_COLUMNS)
     rows = []
     for item in items:
         rows.append(
@@ -70,14 +72,31 @@ def _fetch_all_transactions() -> pd.DataFrame:
                 "amount": _to_float(item.get("amount")),
                 "currency": item.get("currency"),
                 "category_name": item.get("category_name"),
+                "category_slug": item.get("category_slug"),
                 "payment_method_name": item.get("payment_method_name"),
+                "payment_method_id": (
+                    int(item["payment_method_id"])
+                    if item.get("payment_method_id") is not None
+                    else None
+                ),
                 "reconciliation_status": item.get("reconciliation_status"),
-                "account_id": item.get("account_id"),
+                "account_id": (
+                    int(item["account_id"])
+                    if item.get("account_id") is not None
+                    else None
+                ),
+                "image_path": item.get("image_path"),
             }
         )
     df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"]).dt.date
     return df
+
+
+_STMT_COLUMNS = [
+    "id", "account_id", "billing_period", "date",
+    "description", "amount", "reconciliation_status", "pdf_s3_key",
+]
 
 
 def _fetch_all_statement_lines() -> pd.DataFrame:
@@ -95,23 +114,19 @@ def _fetch_all_statement_lines() -> pd.DataFrame:
         scan_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
 
     if not items:
-        return pd.DataFrame(
-            columns=[
-                "id", "account_id", "billing_period", "date",
-                "description", "amount", "reconciliation_status",
-            ]
-        )
+        return pd.DataFrame(columns=_STMT_COLUMNS)
     rows = []
     for item in items:
         rows.append(
             {
                 "id": item.get("id"),
-                "account_id": item.get("account_id"),
+                "account_id": int(item["account_id"]) if item.get("account_id") is not None else None,
                 "billing_period": item.get("billing_period"),
                 "date": item.get("date"),
                 "description": item.get("description"),
                 "amount": _to_float(item.get("amount")),
                 "reconciliation_status": item.get("reconciliation_status"),
+                "pdf_s3_key": item.get("pdf_s3_key"),
             }
         )
     df = pd.DataFrame(rows)
@@ -138,6 +153,61 @@ def _fetch_payment_methods() -> list[str]:
         KeyConditionExpression=Key("PK").eq("REF") & Key("SK").begins_with("PM#"),
     )
     return sorted(i.get("name", "") for i in items)
+
+
+def _fetch_payment_methods_detailed() -> list[dict[str, Any]]:
+    """All payment methods with id, name, and settlement account_id."""
+    items = _query_all(
+        KeyConditionExpression=Key("PK").eq("REF") & Key("SK").begins_with("PM#"),
+    )
+    result: list[dict[str, Any]] = []
+    for i in items:
+        result.append(
+            {
+                "id": int(i.get("id", 0)),
+                "name": i.get("name", ""),
+                "account_id": (
+                    int(i["account_id"]) if i.get("account_id") is not None else None
+                ),
+            }
+        )
+    result.sort(key=lambda pm: pm["id"])
+    return result
+
+
+def _fetch_categories_detailed() -> list[dict[str, Any]]:
+    """All categories with id, name, and slug."""
+    items = _query_all(
+        KeyConditionExpression=Key("PK").eq("REF") & Key("SK").begins_with("CATEGORY#"),
+    )
+    result = [
+        {
+            "id": int(i.get("id", 0)),
+            "name": i.get("name", ""),
+            "slug": i.get("slug", ""),
+        }
+        for i in items
+    ]
+    result.sort(key=lambda c: c["id"])
+    return result
+
+
+def _fetch_accounts_detailed() -> list[dict[str, Any]]:
+    """All accounts with id, name, currency, type."""
+    items = _query_all(
+        KeyConditionExpression=Key("PK").eq("REF") & Key("SK").begins_with("ACCOUNT#"),
+    )
+    result = [
+        {
+            "id": int(i.get("id", 0)),
+            "name": i.get("name", ""),
+            "currency": i.get("currency", ""),
+            "type": i.get("type", ""),
+        }
+        for i in items
+    ]
+    result.sort(key=lambda a: a["id"])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -342,3 +412,204 @@ def get_unreconciled_transactions(year: int, month: int) -> pd.DataFrame:
         filtered[["date", "merchant", "amount", "currency", "payment_method", "reconciliation_status"]]
         .sort_values("date")
     )
+
+
+# ---------------------------------------------------------------------------
+# Richer readers used by the Transactions / Upload / Manual Reconciliation pages
+# ---------------------------------------------------------------------------
+
+
+def list_transactions(
+    start_date: date | None = None,
+    end_date: date | None = None,
+    categories: list[str] | None = None,
+    payment_methods: list[str] | None = None,
+    status: str | None = None,
+    search: str | None = None,
+    account_ids: list[int] | None = None,
+) -> pd.DataFrame:
+    """Flat, filtered transactions DataFrame for the Transactions page.
+
+    ``status`` accepts "all", "reconciled", or "unreconciled". ``search`` does
+    a case-insensitive substring match over merchant and description.
+    """
+    df = _fetch_all_transactions()
+    if df.empty:
+        return df
+
+    mask = pd.Series(True, index=df.index)
+    if start_date is not None:
+        mask &= df["date"] >= start_date
+    if end_date is not None:
+        mask &= df["date"] <= end_date
+    if categories:
+        mask &= df["category_name"].isin(categories)
+    if payment_methods:
+        mask &= df["payment_method_name"].isin(payment_methods)
+    if account_ids:
+        mask &= df["account_id"].isin(account_ids)
+    if status and status != "all":
+        mask &= df["reconciliation_status"] == status
+    if search:
+        needle = search.strip().lower()
+        if needle:
+            merchant = df["merchant"].fillna("").str.lower()
+            description = df["description"].fillna("").str.lower()
+            mask &= merchant.str.contains(needle, regex=False) | description.str.contains(
+                needle, regex=False
+            )
+
+    filtered = df[mask].copy().sort_values(["date", "id"], ascending=[False, False])
+    return filtered
+
+
+def list_statement_lines(
+    account_id: int | None = None,
+    billing_period: str | None = None,
+    status: str | None = None,
+) -> pd.DataFrame:
+    """Statement lines filtered by account/period/status."""
+    df = _fetch_all_statement_lines()
+    if df.empty:
+        return df
+    mask = pd.Series(True, index=df.index)
+    if account_id is not None:
+        mask &= df["account_id"] == int(account_id)
+    if billing_period:
+        mask &= df["billing_period"] == billing_period
+    if status and status != "all":
+        mask &= df["reconciliation_status"] == status
+    return df[mask].copy().sort_values(["date", "id"])
+
+
+def list_unreconciled_transactions_flex(
+    account_id: int | None = None,
+    signed_amount: float | None = None,
+    date_center: date | None = None,
+    tolerance_days: int | None = None,
+    amount_tolerance_pct: float | None = None,
+) -> pd.DataFrame:
+    """Flexible unreconciled-transaction search for manual reconciliation.
+
+    Unlike ``get_unreconciled_transactions`` (which takes year+month),
+    this accepts an optional amount and date-centered window so the manual
+    reconciliation page can widen search beyond exact-cents / small windows.
+    All filters are optional; if everything is None, returns every
+    unreconciled transaction.
+    """
+    df = _fetch_all_transactions()
+    if df.empty:
+        return df
+
+    mask = df["reconciliation_status"] == "unreconciled"
+
+    if account_id is not None:
+        mask &= df["account_id"] == int(account_id)
+
+    if date_center is not None and tolerance_days is not None:
+        from datetime import timedelta as _td
+
+        date_from = date_center - _td(days=int(tolerance_days))
+        date_to = date_center + _td(days=int(tolerance_days))
+        mask &= (df["date"] >= date_from) & (df["date"] <= date_to)
+
+    if signed_amount is not None:
+        if amount_tolerance_pct and amount_tolerance_pct > 0:
+            tol = abs(float(signed_amount)) * (amount_tolerance_pct / 100.0)
+            lo = float(signed_amount) - tol
+            hi = float(signed_amount) + tol
+            if lo > hi:
+                lo, hi = hi, lo
+            mask &= df["amount"].between(lo, hi)
+        else:
+            mask &= df["amount"].round(2) == round(float(signed_amount), 2)
+
+    return df[mask].copy().sort_values(["date", "id"])
+
+
+def get_match_for_line(line_id: str) -> dict | None:
+    """Return the current match row for a statement line, if any.
+
+    Uses a direct query against the MATCH partition (not the dashboard's
+    cached transaction scan) so it always reflects the latest state.
+    """
+    resp = _table.query(
+        KeyConditionExpression=Key("PK").eq("MATCH")
+        & Key("SK").begins_with(f"STMT#{line_id}#"),
+    )
+    items = resp.get("Items", [])
+    if not items:
+        return None
+    raw = items[0]
+    return {
+        "statement_line_id": raw.get("statement_line_id"),
+        "transaction_id": int(raw.get("transaction_id", 0)),
+        "verdict": raw.get("verdict"),
+        "confirmed_by": raw.get("confirmed_by"),
+        "created_at": raw.get("created_at"),
+    }
+
+
+def list_matches_for_period(
+    account_id: int,
+    billing_period: str,
+) -> pd.DataFrame:
+    """All match rows joined with line + txn metadata for a given period."""
+    lines = list_statement_lines(account_id=account_id, billing_period=billing_period)
+    if lines.empty:
+        return pd.DataFrame(
+            columns=[
+                "line_id", "line_date", "line_description", "amount",
+                "txn_id", "txn_date", "merchant", "category_name",
+                "payment_method_name", "verdict", "confirmed_by",
+            ]
+        )
+    matches_rows: list[dict] = []
+    txn_df = _fetch_all_transactions()
+    txn_by_id = {int(r["id"]): r for _, r in txn_df.iterrows()} if not txn_df.empty else {}
+
+    for _, line in lines.iterrows():
+        match = get_match_for_line(str(line["id"]))
+        if not match:
+            continue
+        txn = txn_by_id.get(int(match["transaction_id"]))
+        matches_rows.append(
+            {
+                "line_id": line["id"],
+                "line_date": line["date"],
+                "line_description": line["description"],
+                "amount": line["amount"],
+                "txn_id": match["transaction_id"],
+                "txn_date": txn["date"] if txn is not None else None,
+                "merchant": txn.get("merchant") if txn is not None else None,
+                "category_name": txn.get("category_name") if txn is not None else None,
+                "payment_method_name": (
+                    txn.get("payment_method_name") if txn is not None else None
+                ),
+                "verdict": match.get("verdict"),
+                "confirmed_by": match.get("confirmed_by"),
+            }
+        )
+    return pd.DataFrame(matches_rows)
+
+
+def accounts_detailed() -> list[dict[str, Any]]:
+    return _fetch_accounts_detailed()
+
+
+def payment_methods_detailed() -> list[dict[str, Any]]:
+    return _fetch_payment_methods_detailed()
+
+
+def categories_detailed() -> list[dict[str, Any]]:
+    return _fetch_categories_detailed()
+
+
+def billing_periods_for_account(account_id: int) -> list[str]:
+    """Distinct billing periods that have at least one statement line for
+    the given account, newest first."""
+    df = _fetch_all_statement_lines()
+    if df.empty:
+        return []
+    filtered = df[df["account_id"] == int(account_id)]
+    return sorted(set(filtered["billing_period"].dropna().tolist()), reverse=True)

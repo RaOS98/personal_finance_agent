@@ -188,8 +188,11 @@ When `confident` is false, the bot presents the category options to the user for
 1. Open the PDF with `pdfplumber`
 2. Iterate all pages and extract tables
 3. Match rows where the first cell is a `DD/MM/YYYY` or `DD/MM` date
-4. Parse each matching row into `{date, description, amount}`
-5. Skip rows with zero or negative amounts (credits)
+4. For each matching row, parse every non-date cell with `_parse_amount` and split them into description text vs. numeric values
+5. Build a signed amount:
+   - If the row has one numeric value, keep its sign as `_parse_amount` returned it (including `( … )`, leading `-`, trailing `CR`, leading `ABONO` markers)
+   - If the row has two numeric columns (BCP "Cargos/Consumos" + "Abonos/Pagos"), the rightmost is treated as a credit and negated when populated
+6. Skip rows whose final amount is exactly zero (header padding); negative amounts (refunds, credits) are kept
 
 **Output format (per line):**
 ```json
@@ -200,9 +203,11 @@ When `confident` is false, the bot presents the category options to the user for
 }
 ```
 
+`amount` is signed: positive for charges/debits, negative for refunds/credits/reversals. Downstream code (DynamoDB writers, GSI1 candidate lookup, the reconciler prompt) all assume the same convention so refunds are first-class citizens.
+
 **Notes:**
 - BCP statements contain selectable text, so OCR is not needed.
-- If parsing fails or no lines are found, `ValueError` is raised and the bot surfaces the error to the user.
+- If parsing fails or no lines are found, `ValueError` is raised and the bot/dashboard surface the error to the user.
 - Statement parsing logic will need to be adapted per bank/card when additional accounts are added. For now, only BCP statement formats are handled.
 
 ---
@@ -239,33 +244,42 @@ All candidates for a given statement line are evaluated in a **single Bedrock ca
 }
 ```
 
-By the time the agent sees this input, Python has already pre-filtered candidates by exact amount match and date proximity (±5 days via GSI1 range query) within the same settlement account.
+By the time the agent sees this input, Python has already pre-filtered candidates by exact signed-amount match and date proximity (±5 days via GSI1 range query) within the same settlement account.
 
-**System prompt:**
+**System prompt** (kept in sync with `agent/reconciler.py`):
 ```
 You are a bank reconciliation assistant. You receive a line from a bank
-statement and a list of candidate transactions logged by the user. All
-candidates have the same amount and similar dates. Your job is to
-determine whether each candidate represents the same real-world
-transaction as the statement line.
+statement and a list of candidate transactions the user has logged. All
+candidates share the same signed amount as the statement line, and all
+have dates close to it. Your job is to decide, for EACH candidate, whether
+it represents the same real-world transaction.
 
-Evaluate based on:
+Amounts are signed: positive values are charges/debits, negative values
+are credits/refunds/reversals. The pre-filter guarantees the statement
+line and every candidate share the same sign and absolute amount, so you
+do not need to second-guess the figure itself; focus on whether the
+merchant and date are consistent. For credit lines, look for matching
+refund/return transactions or original purchases that the user later
+reversed.
+
+Evaluate each candidate based on:
 - Merchant name similarity: Bank statements often use abbreviated or
   corporate names (e.g., "CENCOSUD RETAIL SA" for Wong supermarket,
-  "UBER *TRIP" for an Uber ride). Consider whether the statement
-  description plausibly refers to the same merchant.
-- Date consistency: Small differences (1-2 days) are normal due to
-  posting delays. Larger gaps are suspicious.
-- Context: The transaction category may help confirm the match.
+  "UBER *TRIP" for an Uber ride). For credits, an "AMAZON REFUND" line
+  plausibly reverses an earlier "Amazon" purchase.
+- Date consistency: Small differences (1-2 days) are normal due to posting
+  delays. Refunds may post several days after the original charge.
+- Context: The candidate's category may help confirm the match.
 
 Assign one of three verdicts per candidate:
 
-CONFIDENT — Clearly the same transaction.
-LIKELY — Probably the same transaction, but some ambiguity exists.
-UNCERTAIN — Not clear. The merchant names do not have an obvious connection.
+CONFIDENT - Clearly the same transaction.
+LIKELY - Probably the same transaction, with some ambiguity.
+UNCERTAIN - No obvious connection, or another reason to doubt the match.
 
-Respond with ONLY a JSON object in this exact format, no other text:
-{"matches": [{"index": 0, "verdict": "confident", "reason": "..."}]}
+Respond with ONLY a JSON object:
+{"matches": [{"index": 0, "verdict": "confident", "reason": "..."}, ...]}
+with one entry per candidate, in the same order as the input list.
 ```
 
 **Return value:** List of dicts, one per candidate, in input order:
@@ -275,17 +289,16 @@ Respond with ONLY a JSON object in this exact format, no other text:
 ]
 ```
 
-**Verdict logic (applied by the bot after receiving results):**
+**Auto-match logic (applied by `agent/reconciliation.pick_auto_match` after receiving results):**
 
 | Situation | Action |
 |-----------|--------|
-| Exactly one CONFIDENT candidate | Auto-confirm match |
-| No CONFIDENT but one or more LIKELY | Present options to user |
-| All UNCERTAIN | Present all to user with full context |
-| Multiple CONFIDENT | Present to user (indicates a potential duplicate) |
-| No candidates found | Prompt user to add or skip |
+| Exactly one CONFIDENT candidate | Auto-match |
+| Multiple CONFIDENT candidates | Pick the one with the smallest `|Δdate|`; ties leave the line pending |
+| No CONFIDENT but one or more LIKELY/UNCERTAIN | Leave line pending → manual review in the dashboard |
+| No candidates found | Leave line pending |
 
-Unknown verdict values from the model are coerced to `uncertain`.
+Unknown verdict values from the model are coerced to `uncertain`. The dashboard "Manual Reconciliation" page is the canonical surface for everything that isn't auto-matched; the bot only sends a one-shot summary message after `auto_reconcile` finishes.
 
 ---
 
@@ -396,22 +409,31 @@ Before saving a confirmed transaction, the application checks:
 
 ### Reconciliation Orchestration
 
-1. User uploads a statement PDF and identifies the account
-2. `statement_parser.parse_statement_pdf()` extracts lines
-3. Lines are stored in DynamoDB (idempotent via content-hash IDs)
-4. For each pending statement line:
-   - Query via GSI1: same `account_id` + `amount_cents`, date within ±5 days
-   - If no candidates → mark `pending`, notify user
+The auto-reconciliation loop lives in `agent/reconciliation.py` (`auto_reconcile`) and is called identically by the Telegram bot and by the Streamlit "Upload Statement" page. The dashboard passes a `progress_callback` to drive its `st.progress` bar; the bot passes `None`.
+
+1. User uploads a statement PDF (Telegram or dashboard) and identifies the account + billing period
+2. The PDF is uploaded to S3 (`statements/{account_id}/{period}/{uuid}.pdf`) *before* parsing — a parse failure still leaves the original document recoverable
+3. `statement_parser.parse_statement_pdf()` extracts signed-amount lines
+4. `db.save_statement_lines(...)` persists them with the shared `pdf_s3_key` (idempotent via content-hash IDs and `attribute_not_exists(PK)` condition)
+5. `auto_reconcile(billing_period, account_id)` iterates pending lines:
+   - Query via GSI1: same `account_id` + signed `amount_cents`, date within ±5 days
+   - If no candidates → leave `pending`
    - If candidates found → call `reconciler.evaluate_matches(line, candidates)` once
-   - Apply verdict logic (see table above)
-   - Update statement line and transaction statuses in DynamoDB
-5. Send summary to user: X auto-matched, Y need review, Z unmatched
+   - Apply `pick_auto_match` (see table in Task 4): write a reconciliation record only when there is a single confident pick or a clean smallest-`|Δdate|` winner
+6. Send a summary back to the entry-point (bot reply or dashboard toast): X auto-matched, Y still pending
+7. Anything still pending is reviewed in the dashboard's "Manual Reconciliation" page
 
 ### Image Storage
 
 1. Photo arrives → upload to `receipts/tmp/{user_id}.jpg` via `s3_store.upload_tmp_image()`
 2. Transaction confirmed → `s3_store.finalize_image()` copies to `receipts/{yyyy}/{mm}/txn_{id}.jpg`, deletes tmp
 3. Transaction cancelled → `s3_store.delete_tmp_image()` removes tmp object
+
+### Statement PDF Storage
+
+1. PDF arrives (Telegram document or dashboard upload) → `s3_store.upload_statement_pdf(account_id, billing_period, pdf_bytes)` returns the final key
+2. `db.save_statement_lines` stamps `pdf_s3_key` on every line that came out of the parser
+3. The dashboard renders a presigned `s3_store.statement_pdf_url(...)` link on each line so the user can open the original PDF for context
 
 ---
 
