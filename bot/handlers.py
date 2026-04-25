@@ -11,7 +11,15 @@ from telegram.ext import ContextTypes
 
 import config
 import s3_store
-from agent import extractor, categorizer, reconciler, statement_parser
+from agent import (
+    extractor,
+    categorizer,
+    reconciler,
+    statement_parser,
+    intent_classifier,
+    tx_editor,
+    query_agent,
+)
 from db import dynamo as db
 from bot.keyboards import (
     confirmation_keyboard,
@@ -225,8 +233,34 @@ async def _handle_message_inner(
         await _handle_missing_field(update, context, state)
         return
 
-    # --- New transaction from text or photo ---------------------------------
+    # --- Intent routing: only for non-photo, free-form text messages --------
     text = update.message.text or update.message.caption or ""
+
+    if not update.message.photo and text.strip():
+        forced_intent: str | None = None
+        stripped = text.strip()
+        if stripped.startswith("!"):
+            forced_intent = "edit"
+            text = stripped[1:].strip()
+        elif stripped.startswith("?"):
+            forced_intent = "query"
+            text = stripped[1:].strip()
+
+        if forced_intent:
+            intent = forced_intent
+        else:
+            classified = intent_classifier.classify_intent(text)
+            intent = classified.get("intent", "new_transaction")
+
+        if intent == "edit":
+            await _handle_edit_intent(update, context, state, user_id, text)
+            return
+        if intent == "query":
+            await _handle_query_intent(update, context, state, user_id, text)
+            return
+        # new_transaction → fall through
+
+    # --- New transaction from text or photo ---------------------------------
     image_bytes = None
     telegram_image_id = None
     tmp_s3_key = None
@@ -486,6 +520,137 @@ async def _handle_missing_field(
 
 
 # ---------------------------------------------------------------------------
+# Edit / query intents
+# ---------------------------------------------------------------------------
+
+async def _handle_edit_intent(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    state: dict,
+    user_id: int,
+    text: str,
+) -> None:
+    recent = db.list_recent_transactions(limit=1)
+    if not recent:
+        await update.message.reply_text("No recent transactions to edit.")
+        return
+
+    target = recent[0]
+    try:
+        result = tx_editor.parse_edit_request(text, target)
+    except Exception:
+        logger.exception("tx_editor failed")
+        await update.message.reply_text(
+            "I couldn't parse that edit. Try something like "
+            "'change amount to 25'."
+        )
+        return
+
+    field = result.get("field")
+    new_value = result.get("new_value")
+
+    if not result.get("confident") or not field or new_value is None:
+        await update.message.reply_text(
+            f"{format_transaction_summary(target)}\n\n"
+            "I wasn't sure what to change. Reply with something like "
+            "'change amount to 25'."
+        )
+        return
+
+    # --- Validate + coerce per field ----------------------------------------
+    if field == "amount":
+        try:
+            new_value = float(new_value)
+        except (TypeError, ValueError):
+            await update.message.reply_text(
+                "I couldn't read that as a number. Try 'change amount to 25'."
+            )
+            return
+
+    elif field == "date":
+        try:
+            coerced = _coerce_txn_date(new_value)
+            new_value = coerced.isoformat()
+        except (TypeError, ValueError):
+            await update.message.reply_text(
+                "I couldn't read that date. Use ISO format (YYYY-MM-DD)."
+            )
+            return
+
+    elif field == "category_slug":
+        slug = str(new_value)
+        if slug not in CATEGORY_NAME_BY_SLUG:
+            state["state"] = "awaiting_edit_category_select"
+            state["edit_target"] = {
+                "id": int(target["id"]),
+                "old_summary": format_transaction_summary(target),
+            }
+            await update.message.reply_text(
+                "Choose a category:",
+                reply_markup=category_keyboard(prefix="editcat"),
+            )
+            return
+
+    elif field == "payment_method_id":
+        pm = db.resolve_payment_method(str(new_value))
+        if pm is None:
+            await update.message.reply_text(
+                "Payment method not recognized. Try: sapphire, amex, yape, cash."
+            )
+            return
+        new_value = int(pm["id"])
+
+    # --- Stage confirmation -------------------------------------------------
+    old_value = target.get(field)
+    state["state"] = "awaiting_edit_target_confirm"
+    state["edit_target"] = {
+        "id": int(target["id"]),
+        "field": field,
+        "new_value": new_value,
+        "old_value": old_value,
+        "old_summary": format_transaction_summary(target),
+    }
+
+    await update.message.reply_text(
+        f"Update transaction #{int(target['id'])}: change {field} "
+        f"from {old_value!r} to {new_value!r}?",
+        reply_markup=yes_no_keyboard("editconfirm"),
+    )
+
+
+async def _handle_query_intent(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    state: dict,
+    user_id: int,
+    text: str,
+) -> None:
+    await update.message.reply_text("Thinking…")
+
+    try:
+        result = query_agent.answer_query(text)
+    except Exception:
+        logger.exception("query_agent failed")
+        await update.message.reply_text(
+            "I couldn't answer that. Try rephrasing or use `?` prefix."
+        )
+        return
+
+    answer = result.get("answer")
+    if not answer or result.get("error"):
+        await update.message.reply_text(
+            "I couldn't answer that. Try rephrasing or use `?` prefix."
+        )
+        return
+
+    source_ids = result.get("source_txn_ids") or []
+    reply = str(answer)
+    if source_ids:
+        reply += "\n\nBased on: " + ", ".join(f"#{i}" for i in source_ids)
+    await update.message.reply_text(reply)
+
+
+# ---------------------------------------------------------------------------
 # Callback dispatch
 # ---------------------------------------------------------------------------
 
@@ -588,6 +753,55 @@ async def _handle_callback_inner(
             s3_store.delete_tmp_image(txn["tmp_s3_key"])
         _mark_cleared(state)
         await query.edit_message_text("❌ Transaction cancelled (duplicate).")
+        return
+
+    if data == "editconfirm_yes":
+        await _apply_confirmed_edit(query, state)
+        return
+
+    if data == "editconfirm_no":
+        _mark_cleared(state)
+        await query.edit_message_text("❌ Edit cancelled.")
+        return
+
+    if data.startswith("editcat_"):
+        slug = data.removeprefix("editcat_")
+        if slug not in CATEGORY_NAME_BY_SLUG:
+            await query.edit_message_text("Unknown category.")
+            return
+        target_stub = state.get("edit_target") or {}
+        target_id = target_stub.get("id")
+        if target_id is None:
+            await query.edit_message_text("No edit in progress.")
+            return
+        category = db.get_category_by_slug(slug)
+        if category is None:
+            await query.edit_message_text("Unknown category.")
+            return
+
+        # Re-fetch current target for accurate old_summary + old_value.
+        current = db._get_transaction(int(target_id))
+        if current is None:
+            await query.edit_message_text("Transaction not found.")
+            _mark_cleared(state)
+            return
+        current.pop("_sk", None)
+
+        state["state"] = "awaiting_edit_target_confirm"
+        state["edit_target"] = {
+            "id": int(target_id),
+            "field": "category_slug",
+            "new_value": slug,
+            "old_value": current.get("category_slug"),
+            "old_summary": format_transaction_summary(current),
+            "category_id": int(category["id"]),
+            "category_name": category["name"],
+        }
+        await query.edit_message_text(
+            f"Update transaction #{int(target_id)}: change category "
+            f"from {current.get('category_slug')!r} to {slug!r}?",
+            reply_markup=yes_no_keyboard("editconfirm"),
+        )
         return
 
     if data.startswith("recon_match_"):
@@ -693,6 +907,69 @@ async def _save_transaction(query, state: dict, user_id: int) -> None:
 
     _mark_cleared(state)
     await query.edit_message_text(f"✅ Transaction saved! (ID: {txn_id})")
+
+
+# ---------------------------------------------------------------------------
+# Apply confirmed edit
+# ---------------------------------------------------------------------------
+
+async def _apply_confirmed_edit(query, state: dict) -> None:
+    edit_target = state.get("edit_target")
+    if not edit_target:
+        await query.edit_message_text("No edit in progress.")
+        _mark_cleared(state)
+        return
+
+    txn_id = int(edit_target["id"])
+    field = edit_target.get("field")
+    new_value = edit_target.get("new_value")
+
+    if not field:
+        await query.edit_message_text("No field to update.")
+        _mark_cleared(state)
+        return
+
+    fields_to_update: dict = {field: new_value}
+    if field == "category_slug":
+        if edit_target.get("category_id") is not None:
+            fields_to_update["category_id"] = int(edit_target["category_id"])
+        if edit_target.get("category_name"):
+            fields_to_update["category_name"] = edit_target["category_name"]
+        else:
+            category = db.get_category_by_slug(str(new_value))
+            if category is not None:
+                fields_to_update["category_id"] = int(category["id"])
+                fields_to_update["category_name"] = category["name"]
+
+    if field == "payment_method_id":
+        pm_name = None
+        try:
+            resp = db._ref_cache.get("payment_methods_by_id", {}).get(int(new_value))
+            if resp:
+                pm_name = resp.get("name")
+        except Exception:
+            pm_name = None
+        if pm_name:
+            fields_to_update["payment_method_name"] = pm_name
+
+    try:
+        updated = db.update_transaction_fields(txn_id, fields_to_update)
+    except KeyError:
+        await query.edit_message_text("Transaction not found.")
+        _mark_cleared(state)
+        return
+    except Exception:
+        logger.exception("Edit failed for txn %s", txn_id)
+        await query.edit_message_text(
+            "Something went wrong applying that edit. Please try again."
+        )
+        _mark_cleared(state)
+        return
+
+    _mark_cleared(state)
+    await query.edit_message_text(
+        f"{format_transaction_summary(updated)}\n\n✅ Updated."
+    )
 
 
 # ---------------------------------------------------------------------------

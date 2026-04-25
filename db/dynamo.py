@@ -34,6 +34,7 @@ from typing import Any
 
 import boto3
 from boto3.dynamodb.conditions import Attr, Key
+from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError
 
 import config
@@ -44,6 +45,8 @@ logger = logging.getLogger(__name__)
 
 _dynamodb = boto3.resource("dynamodb", region_name=config.AWS_REGION)
 _table = _dynamodb.Table(config.DYNAMODB_TABLE)
+
+_serializer = TypeSerializer()
 
 _TWO_PLACES = Decimal("0.01")
 
@@ -329,6 +332,146 @@ def update_transaction_reconciliation_status(transaction_id: int, status: str) -
             ":g": f"STATUS#TXN#{status}",
         },
     )
+
+
+_EDITABLE_TXN_FIELDS = {
+    "merchant",
+    "description",
+    "amount",
+    "category_id",
+    "category_slug",
+    "category_name",
+    "date",
+    "payment_method_id",
+    "payment_method_name",
+}
+
+
+def update_transaction_fields(txn_id: int, fields: dict[str, Any]) -> dict[str, Any]:
+    """Apply partial updates to an existing transaction.
+
+    If ``amount`` or ``date`` is among the edited fields, the SK and GSI1
+    partition key are derived from them — a plain UpdateItem cannot rewrite
+    keys. In that case the item is deleted and re-inserted under the new
+    keys in a single TransactWriteItems call, preserving ``id``,
+    ``created_at``, ``reconciliation_status``, ``telegram_image_id``, and
+    ``image_path``.
+
+    Returns the final normalized item. Raises ``KeyError`` if the txn
+    does not exist, or ``ValueError`` if a disallowed field is supplied.
+    """
+    current = _get_transaction(int(txn_id))
+    if current is None:
+        raise KeyError(f"Transaction {txn_id} not found")
+
+    disallowed = set(fields.keys()) - _EDITABLE_TXN_FIELDS
+    if disallowed:
+        raise ValueError(f"Disallowed fields: {sorted(disallowed)}")
+
+    old_sk = current.pop("_sk")
+    old_key = {"PK": "TXN", "SK": old_sk}
+
+    needs_key_rewrite = "amount" in fields or "date" in fields
+
+    if not needs_key_rewrite:
+        update_parts = []
+        expr_values: dict[str, Any] = {}
+        expr_names: dict[str, str] = {}
+        for k, v in fields.items():
+            placeholder_name = f"#f_{k}"
+            placeholder_value = f":v_{k}"
+            expr_names[placeholder_name] = k
+            expr_values[placeholder_value] = (
+                _to_decimal(v) if k == "amount" else v
+            )
+            update_parts.append(f"{placeholder_name} = {placeholder_value}")
+
+        _table.update_item(
+            Key=old_key,
+            UpdateExpression="SET " + ", ".join(update_parts),
+            ExpressionAttributeNames=expr_names,
+            ExpressionAttributeValues=expr_values,
+        )
+        updated = _get_transaction(int(txn_id))
+        if updated is not None:
+            updated.pop("_sk", None)
+        return updated
+
+    # --- Key rewrite path: delete old + put new, atomically -----------------
+    _load_reference()
+    new_amount = fields.get("amount", current["amount"])
+    new_date = fields.get("date", current["date"])
+    new_merchant = fields.get("merchant", current.get("merchant"))
+    new_description = fields.get("description", current.get("description"))
+    new_category_id = fields.get("category_id", current.get("category_id"))
+    new_category_slug = fields.get("category_slug", current.get("category_slug"))
+    new_category_name = fields.get("category_name", current.get("category_name"))
+    new_pm_id = fields.get("payment_method_id", current.get("payment_method_id"))
+    new_pm_name = fields.get("payment_method_name", current.get("payment_method_name"))
+
+    date_iso = _iso(new_date)
+    cents = _amount_cents(new_amount)
+    amount_dec = _to_decimal(new_amount)
+    account_id = _account_id_for_payment_method(int(new_pm_id)) if new_pm_id is not None else current.get("account_id")
+    txn_id_int = int(current["id"])
+    status = current.get("reconciliation_status", "unreconciled")
+
+    new_item: dict[str, Any] = {
+        "PK": "TXN",
+        "SK": f"{date_iso}#{txn_id_int:08d}",
+        "GSI1PK": f"AMT#{account_id}#{cents}" if account_id is not None else f"AMT#NONE#{cents}",
+        "GSI1SK": f"{date_iso}#{txn_id_int:08d}",
+        "GSI2PK": f"STATUS#TXN#{status}",
+        "GSI2SK": f"{date_iso}#{txn_id_int:08d}",
+        "id": txn_id_int,
+        "amount": amount_dec,
+        "amount_cents": cents,
+        "currency": current.get("currency"),
+        "date": date_iso,
+        "merchant": new_merchant,
+        "description": new_description,
+        "category_id": int(new_category_id) if new_category_id is not None else None,
+        "category_slug": new_category_slug,
+        "category_name": new_category_name,
+        "payment_method_id": int(new_pm_id) if new_pm_id is not None else None,
+        "payment_method_name": new_pm_name,
+        "account_id": account_id,
+        "telegram_image_id": current.get("telegram_image_id"),
+        "image_path": current.get("image_path"),
+        "reconciliation_status": status,
+        "created_at": current.get("created_at"),
+    }
+
+    def _serialize_map(d: dict[str, Any]) -> dict[str, Any]:
+        return {k: _serializer.serialize(v) for k, v in d.items() if v is not None}
+
+    _table.meta.client.transact_write_items(
+        TransactItems=[
+            {"Delete": {
+                "TableName": config.DYNAMODB_TABLE,
+                "Key": _serialize_map(old_key),
+            }},
+            {"Put": {
+                "TableName": config.DYNAMODB_TABLE,
+                "Item": _serialize_map(new_item),
+            }},
+        ]
+    )
+    return _normalize_item(new_item)
+
+
+def list_recent_transactions(limit: int) -> list[dict[str, Any]]:
+    """Return the most recent transactions, newest first.
+
+    SK format ``{date_iso}#{txn_id:08d}`` means reverse-sort within the TXN
+    partition yields newest-by-date (ties broken by descending id).
+    """
+    resp = _table.query(
+        KeyConditionExpression=Key("PK").eq("TXN"),
+        ScanIndexForward=False,
+        Limit=int(limit),
+    )
+    return [_normalize_item(i) for i in resp.get("Items", [])]
 
 
 def _get_transaction(transaction_id: int) -> dict[str, Any] | None:
