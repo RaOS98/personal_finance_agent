@@ -18,16 +18,16 @@ An AI-powered agent that runs on Telegram. The user sends photos of receipts, tr
 4. **Store** — Confirmed transactions are saved to DynamoDB; receipt images go to S3.
 5. **Edit** — Send a natural-language correction (e.g., "change amount to 25") to update the most recent transaction. The bot shows a yes/no diff before any write.
 6. **Query** — Ask questions in plain English or Spanish (e.g., "how much did I spend on food this month?"). The agent runs a tool-use loop over DynamoDB and replies with cited transaction ids.
-7. **Reconcile** — Monthly bank statement PDFs are uploaded. Python pre-filters by amount and date to find candidates, then the agent evaluates all candidates for a statement line in a single batched call. Matches are triaged into three tiers: Confident (auto-confirmed), Likely (quick user confirmation), and Uncertain (user review with context).
-8. **Visualize** — A local Streamlit dashboard backed by DynamoDB provides real-time visibility into spending by category, payment method, and time period.
+7. **Reconcile** — Monthly bank statement PDFs are uploaded either through the Telegram bot or the Streamlit dashboard. Python pre-filters by signed amount and date; the agent evaluates all candidates for a statement line in one batched call. Confident singletons auto-match (with a date-diff tiebreaker for ties); everything else is reviewed in the dashboard's Manual Reconciliation page.
+8. **Visualize and edit** — A local Streamlit dashboard backed by DynamoDB provides real-time visibility into spending and a writeable surface for transaction edits, statement uploads, and manual reconciliation. A simple shared-password gate via `st.secrets` keeps it out of casual hands.
 
 ## Architecture
 
 - **Runtime**: AWS Lambda (python3.12, arm64), triggered by Telegram webhook via API Gateway HTTP API
 - **AI**: Amazon Bedrock — Claude Sonnet 4.6 for vision extraction, Claude Haiku 4.5 for intent classification, categorization, edit parsing, query tool-use, and reconciliation
-- **Database**: DynamoDB single-table design with two GSIs
-- **Storage**: S3 for receipt images (Standard → Standard-IA lifecycle)
-- **Secrets**: AWS SSM Parameter Store
+- **Database**: DynamoDB single-table design with three GSIs
+- **Storage**: S3 for receipt images and bank statement PDFs (Standard → Standard-IA lifecycle)
+- **Secrets**: AWS SSM Parameter Store (Telegram tokens), `.streamlit/secrets.toml` (dashboard password)
 - **Bot state**: DynamoDB items with 1-hour TTL
 
 ## Transaction Categories
@@ -95,8 +95,15 @@ curl -X POST "https://api.telegram.org/bot$TOKEN/setWebhook" \
 
 ```bash
 export AWS_PROFILE=your-profile AWS_REGION=us-east-1
+# Optional: enable the password gate for the dashboard
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml  # then edit the password
 streamlit run dashboard/app.py
 ```
+
+The dashboard surfaces seven pages: Monthly Summary, Transactions (filter +
+inline edit), Category Breakdown, Trends, Upload Statement (PDF parse +
+preview + auto-reconcile), Manual Reconciliation (per-line candidate review,
+unmatch, add-as-new), and Reconciliation Status.
 
 ## Project Documentation
 
@@ -110,6 +117,6 @@ streamlit run dashboard/app.py
 ## Future Scope
 
 - Additional banks and cards (Interbank, BBVA, Cencosud Scotiabank)
-- Income and credit tracking
+- Income tracking (salary, recurring inflows)
 - Automated spending insights and alerts
 - Budget tracking and goals

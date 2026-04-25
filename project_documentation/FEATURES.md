@@ -234,78 +234,60 @@ The query agent has access to four tools:
 
 ## 5. Monthly Reconciliation
 
-At the end of each billing cycle, the user uploads bank statement PDFs for each active account/card. The system matches logged transactions against statement lines.
+At the end of each billing cycle, the user uploads bank statement PDFs for each active account/card. The system auto-matches what it can confidently and surfaces the rest for manual review in the dashboard.
 
 ### 5.1 Statement Upload
 
-**User sends:** A PDF file to the Telegram bot with a message identifying the account (e.g., "Sapphire statement April").
+There are two equivalent entry points; both upload the PDF to S3, parse it, and persist the lines.
 
-**Agent does:**
-1. Parses the PDF with `pdfplumber` to extract individual statement lines (date, description, amount)
-2. Identifies the account from the user's message
-3. Stores the statement lines in DynamoDB (idempotent — re-uploading the same statement is safe)
+**Telegram bot.** Send a PDF document to the bot. The bot extracts the account/period from the caption (or asks for them), uploads the PDF, parses it, runs auto-reconcile, and posts a summary message. The PDF is uploaded to S3 *before* parsing, so even a parse failure leaves a debug artifact behind.
+
+**Streamlit dashboard → Upload Statement page.** Pick the account, billing period, and PDF file. The page shows an editable preview of every parsed line (`st.data_editor`), so you can fix the description or amount before committing. After "Save statement," an optional "Auto-reconcile now" button runs the same loop the bot uses, with a progress bar.
+
+Both paths call the same `agent/reconciliation.auto_reconcile` so the matching outcome is identical regardless of where the upload originated.
 
 ### 5.2 Matching Process
 
 Reconciliation runs in two stages:
 
 **Stage 1 — Python pre-filter:**
-- For each statement line, query DynamoDB via GSI1 for transactions with the same exact amount and settlement account within ±5 days of the statement date
-- If no candidates are found, flag the statement line as pending
-- If candidates are found, pass all of them to the agent in a single batched call
+- For each pending statement line, query DynamoDB via GSI1 for transactions with the same signed `amount_cents` and same settlement account within ±5 days of the statement date
+- If no candidates are found, the line stays pending for manual review
+- If candidates are found, all of them are passed to the agent in a single batched Bedrock call
 
 **Stage 2 — Agent evaluation (batched):**
-- The agent receives the statement line and all candidates at once
-- It assigns a verdict to each candidate: Confident, Likely, or Uncertain
-- One Bedrock call per statement line, regardless of how many candidates exist
+- `agent/reconciler.evaluate_matches` receives the statement line and all candidates at once
+- It assigns a verdict to each candidate: Confident, Likely, or Uncertain (one Bedrock call per line, regardless of candidate count)
 
 | Verdict | Meaning | Action |
 |---------|---------|--------|
-| **Confident** | Clearly the same transaction | Auto-confirmed |
-| **Likely** | Probably the same | Sent to user for quick yes/no confirmation |
-| **Uncertain** | Unclear match | Sent to user with context for manual review |
+| **Confident** | Clearly the same transaction | Auto-matched if there is exactly one confident candidate (or one that wins the smallest-`|Δdate|` tiebreaker) |
+| **Likely** | Probably the same | Left pending for the dashboard manual-review page |
+| **Uncertain** | Unclear match | Left pending for the dashboard manual-review page |
 
-### 5.3 Reconciliation Review via Telegram
+Negative-amount statement lines (refunds, credits, ABONOs) are kept and matched against transactions of the same sign — the parser, the database, and the LLM prompt all use the same signed-amount convention.
 
-For Likely and Uncertain matches, the bot sends review requests:
+### 5.3 Manual Reconciliation Review (Streamlit dashboard)
 
-**Likely match:**
-```
-🔄 Match found:
-  Statement:   CENCOSUD RETAIL SA — S/. 145.30 — Apr 13
-  Your record:  Wong Supermercados — S/. 145.30 — Apr 13 — Groceries
+Anything not auto-matched is reviewed in the **Manual Reconciliation** page of the dashboard. The page has two columns:
 
-  Is this the same transaction?
-  ✅ Yes    ❌ No
-```
+**Left column — pending statement lines:**
+- One expandable card per line, with date, description, signed amount, and a presigned link back to the original PDF
+- "Widen search" controls per line: extend the date window, allow ±tolerance on amount, or include other accounts
+- "Ask the agent" button: re-runs `evaluate_matches` against the candidates currently on screen; verdicts are rendered next to each candidate
+- Per-candidate actions: **Match**, **Skip**, **Add as new transaction** (creates a transaction pre-populated from the statement line and immediately matches it)
 
-**Uncertain match (multiple candidates):**
-```
-❓ Unclear match:
-  Statement: UBER *TRIP — S/. 18.50 — Apr 10
+**Right column — reconciled lines this period:**
+- Every line that was matched in the selected billing period
+- One-click **Unmatch** to undo a bad pairing
 
-  Possible matches:
-  1. Uber to office — S/. 18.50 — Apr 9 — Transportation
-  2. Uber to dinner — S/. 18.50 — Apr 10 — Transportation
-
-  Which one? (1, 2, or None)
-```
-
-**No match found:**
-```
-⚠️ No match:
-  Statement: SPOTIFY — S/. 22.90 — Apr 5
-
-  No logged transaction matches this charge.
-  Would you like to add it now?
-  ✅ Add    ⏭️ Skip
-```
+A footer **"Start from a transaction"** helper inverts the lookup: pick an unreconciled transaction first, then see candidate statement lines.
 
 ### 5.4 Reconciliation Outcomes
 
 After reconciliation, every statement line has one of these statuses:
 - **Matched** — linked to a logged transaction (auto or user-confirmed)
-- **Added** — no prior record existed; user added it during reconciliation
+- **Added** — no prior record existed; user added it from the dashboard during review
 - **Skipped** — user chose to skip (e.g., bank fees they don't want to track)
 - **Pending** — not yet reviewed
 
@@ -317,12 +299,20 @@ Every logged transaction has one of these statuses:
 
 ## 6. Dashboard
 
-A local Streamlit application providing real-time visibility into personal finances. Reads from DynamoDB — requires AWS credentials in the environment.
+A local Streamlit application providing real-time visibility *and* edit access to personal finances. Reads from DynamoDB via a cached read layer (`dashboard/dynamo_reader.py`); writes go through `dashboard/dynamo_writer.py`, which automatically clears the read cache after every successful mutation. Requires AWS credentials in the environment.
 
 ```bash
 export AWS_PROFILE=your-profile AWS_REGION=us-east-1
+# Optional: configure the password gate
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # then edit the password
 streamlit run dashboard/app.py
 ```
+
+### 6.0 Authentication
+
+If `dashboard_password` is set in `.streamlit/secrets.toml`, the app shows a sign-in form before any page renders. An incorrect password keeps the user on the form; the correct password unlocks the session via `st.session_state`. If no password is configured (the default for a fresh checkout), the gate is bypassed — the dashboard is intended for a single trusted machine.
+
+The `secrets.toml` file is gitignored; only `.streamlit/secrets.toml.example` is checked in.
 
 ### 6.1 Monthly Summary
 
@@ -333,23 +323,47 @@ The default view. Shows spending for a selected month:
 - Spending by category (horizontal bar chart)
 - Spending by payment method (horizontal bar chart)
 
-### 6.2 Category Breakdown
+### 6.2 Transactions
+
+A full transaction-list view with inline editing.
+
+- Filters: date range, category, payment method, reconciliation status, free-text search over merchant/description
+- Signed-amount column (negative for refunds and credits) with currency
+- **Inline edit** via `st.data_editor` for `merchant`, `description`, `amount`, `date`, `category`, and `payment_method`. Read-only columns are `id`, `currency`, `reconciliation_status`, and `image_path`. Amount/date edits trigger the same atomic key-rewrite path used by the bot
+- Receipt thumbnail expander pulls the image from S3 via a presigned URL when `image_path` is set
+- Each saved edit clears the dashboard read cache automatically
+
+### 6.3 Category Breakdown
 
 Drill down into any category to see individual transactions. Filterable by date range and payment method.
 
-### 6.3 Trends
+### 6.4 Trends
 
 Monthly spending over time:
 - Total spending per month (line chart, by currency)
 - Per-category trends (line chart)
 - Selectable date range
 
-### 6.4 Reconciliation Status
+### 6.5 Upload Statement
+
+End-to-end statement ingest from the dashboard.
+
+- File uploader for the bank statement PDF
+- Account picker (from the `REF#ACCOUNT` items) and billing-period picker
+- Editable parse preview (`st.data_editor`) with the parsed lines — adjust descriptions or amounts before committing
+- "Save statement" persists every line via `dynamo_writer.commit_statement` (idempotent: re-uploading the same statement is safe)
+- "Auto-reconcile now" button runs `agent/reconciliation.auto_reconcile` with a progress bar, then displays a summary
+
+### 6.6 Manual Reconciliation
+
+The interactive review surface for everything `auto_reconcile` couldn't decide on its own. See [Section 5.3](#53-manual-reconciliation-review-streamlit-dashboard) for the full behaviour.
+
+### 6.7 Reconciliation Status
 
 Overview of reconciliation health:
 - Reconciled vs. unreconciled transaction counts for the selected month
 - Statement line counts by status (matched, added, skipped, pending)
-- List of pending statement lines (date, description, amount, account)
+- List of pending statement lines (date, description, amount, account, link to PDF)
 - List of unreconciled transactions (date, merchant, amount, payment method)
 
 ---
@@ -374,11 +388,13 @@ The agent recognizes these in any position within the message and is case-insens
 ## Features NOT Included
 
 The following are explicitly out of scope:
-- Income and credit tracking (salary, reimbursements — statement credits are skipped during reconciliation)
+- Income tracking (salary)
 - Budget setting and tracking
 - Automated spending alerts or notifications
-- Multi-user support
+- Multi-user support (a single shared `dashboard_password` and a single Telegram user are assumed)
 - FX conversion between PEN and USD
 - Recurring transaction detection
 - Bank API integration
 - Additional banks (Interbank, BBVA, Cencosud Scotiabank) — BCP only for now
+
+Note: refunds and statement credits *are* tracked end-to-end. Negative amounts flow through the parser, the database, and the matcher unchanged.

@@ -2,7 +2,7 @@
 
 ## Overview
 
-All data is stored in a single DynamoDB table (`finance-agent`) using a single-table design. Every entity type is distinguished by its `PK` and `SK` values. Two Global Secondary Indexes (GSI1, GSI2) cover access patterns that cannot be served by the primary key.
+All data is stored in a single DynamoDB table (`finance-agent`) using a single-table design. Every entity type is distinguished by its `PK` and `SK` values. Three Global Secondary Indexes (GSI1, GSI2, GSI3) cover access patterns that cannot be served by the primary key.
 
 ---
 
@@ -40,6 +40,17 @@ Query pattern: given a statement line with `account_id` and `amount`, find all t
 | GSI2SK | `{date_iso}#{txn_id:08d}` |
 
 Query pattern: find all unreconciled (or reconciled) transactions across all dates.
+
+### GSI3 — Statement-line lookup by id
+
+Enables an O(1) fetch for a single statement line when only its content-hash id is known (manual reconciliation, unmatch, or "ask the agent" flows).
+
+| Key | Value |
+|-----|-------|
+| GSI3PK | `LINE#{line_id}` |
+| GSI3SK | (not projected) |
+
+Query pattern: given a `line_id`, retrieve the matching `STMT` item without scanning the table. `db.dynamo._get_statement_line` queries this GSI first and falls back to a table scan when the index is empty for a given line — needed only for legacy items written before `GSI3PK` was added.
 
 ---
 
@@ -180,17 +191,19 @@ Items extracted from bank statement PDFs. Grouped by account and billing period.
 |-----------|------|-------------|
 | PK | S | `STMT#{account_id}#{billing_period}` |
 | SK | S | `{date_iso}#{line_id}` |
+| GSI3PK | S | `LINE#{line_id}` (added on every new statement line; may be missing on legacy items) |
 | id | S | Content hash (blake2b 6-byte digest, hex) |
 | account_id | N | Settlement account ID |
 | billing_period | S | `YYYY-MM` |
 | date | S | `YYYY-MM-DD` |
 | description | S | Merchant/description as shown on statement |
-| amount | N (Decimal) | Charge amount (positive = debit) |
-| amount_cents | N | Amount × 100 as integer |
+| amount | N (Decimal) | Signed charge amount (positive = debit/charge, negative = credit/refund/reversal) |
+| amount_cents | N | `amount × 100` as a signed integer; the sign is preserved so credits are matched against negative-amount transactions via GSI1 |
+| pdf_s3_key | S | S3 key of the original PDF (`statements/{account_id}/{billing_period}/{uuid}.pdf`); shared by every line that came out of the same upload |
 | reconciliation_status | S | `pending`, `matched`, `added`, or `skipped` |
 | created_at | S | ISO 8601 timestamp |
 
-**ID generation:** `blake2b(f"{account_id}|{billing_period}|{date}|{description}|{amount_cents}", digest_size=6).hexdigest()`. This makes re-importing the same statement idempotent — duplicate lines are rejected by `ConditionExpression="attribute_not_exists(PK)"`.
+**ID generation:** `blake2b(f"{account_id}|{billing_period}|{date}|{description}|{amount_cents}", digest_size=6).hexdigest()`. This makes re-importing the same statement idempotent — duplicate lines are rejected by `ConditionExpression="attribute_not_exists(PK)"`. Because `amount_cents` is signed, refund and credit lines hash to a different id than a charge of the same magnitude on the same day.
 
 ---
 
@@ -233,6 +246,6 @@ TTL is set to `now + USER_STATE_TTL_SECONDS` (default: 3600) on every write. Exp
 
 **The `Other` category requires a description.** Enforced at the application level. When the agent assigns the Other category, it ensures the description field is populated.
 
-**Statement credits are skipped.** Salary deposits, reimbursements, and payments from friends appear as statement lines but are skipped by the user during reconciliation. Their status is set to `skipped`.
+**Statement credits and refunds are first-class.** The parser keeps negative amounts; statement-line `amount` and `amount_cents` are signed end-to-end, GSI1 partitions by signed `amount_cents`, and the reconciler prompt is taught to match credit lines against same-sign refund transactions. Salary deposits and bank-fee reversals can either be matched (if a corresponding transaction was logged) or marked `skipped` from the dashboard.
 
-**Images are stored in S3, not locally.** Receipt images follow a tmp→final copy pattern via `s3_store.py`. The `image_path` attribute on a transaction holds the S3 object key (`receipts/{yyyy}/{mm}/txn_{id}.jpg`).
+**Receipt images and statement PDFs are stored in S3.** Receipt images follow a tmp→final copy pattern via `s3_store.upload_tmp_image / finalize_image`; the `image_path` attribute on a transaction holds the S3 object key (`receipts/{yyyy}/{mm}/txn_{id}.jpg`). Statement PDFs are uploaded once via `s3_store.upload_statement_pdf` and the resulting key is stamped onto every line on the `pdf_s3_key` attribute, so the dashboard can render a presigned link from any line back to the source document.

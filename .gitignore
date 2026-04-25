@@ -160,3 +160,6 @@ packaged-template.yaml
 credentials
 credentials.json
 *.pem
+
+# Streamlit secrets (dashboard password, etc.)
+.streamlit/secrets.toml

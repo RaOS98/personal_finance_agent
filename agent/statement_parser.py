@@ -30,29 +30,49 @@ def _normalize_date(raw_date: str) -> str:
 def _parse_amount(value: str) -> float | None:
     """Parse an amount string to float, handling common formats.
 
-    BCP statements may use formats like: 1,234.56 or 1.234,56 or just 123.45
+    BCP statements may use formats like: 1,234.56 or 1.234,56 or just 123.45.
+    Negatives may be expressed with a leading "-" or with surrounding
+    parentheses (e.g. ``(145.30)`` -> ``-145.30``); a trailing "CR" or
+    leading "ABONO " marker is also treated as a credit.
     """
     if not value:
         return None
 
     text = value.strip()
-    # Remove currency symbols and whitespace
+    if not text:
+        return None
+
+    negative = False
+
+    upper = text.upper()
+    if upper.endswith("CR") or upper.endswith("CR."):
+        negative = True
+        text = re.sub(r"(?i)cr\.?$", "", text).strip()
+    if upper.startswith("ABONO"):
+        negative = True
+        text = re.sub(r"(?i)^abono[s]?\s*", "", text).strip()
+
+    if text.startswith("(") and text.endswith(")"):
+        negative = True
+        text = text[1:-1].strip()
+
+    if text.startswith("-"):
+        negative = not negative
+        text = text[1:].strip()
+    elif text.startswith("+"):
+        text = text[1:].strip()
+
     text = re.sub(r"[S/.$\s]", "", text)
 
     if not text:
         return None
 
-    # Handle thousand separators: if comma is before dot, commas are thousands
-    # e.g., 1,234.56
     if "," in text and "." in text:
         if text.rindex(",") < text.rindex("."):
             text = text.replace(",", "")
         else:
-            # e.g., 1.234,56 — dot is thousands, comma is decimal
             text = text.replace(".", "").replace(",", ".")
     elif "," in text:
-        # Could be thousands (1,234) or decimal (123,45)
-        # If exactly 2 digits after comma, treat as decimal
         after_comma = text.split(",")[-1]
         if len(after_comma) == 2:
             text = text.replace(",", ".")
@@ -60,9 +80,13 @@ def _parse_amount(value: str) -> float | None:
             text = text.replace(",", "")
 
     try:
-        return float(text)
+        result = float(text)
     except ValueError:
         return None
+
+    if negative:
+        result = -abs(result)
+    return result
 
 
 def parse_statement_pdf(pdf_source: str | bytes) -> list[dict]:
@@ -73,7 +97,13 @@ def parse_statement_pdf(pdf_source: str | bytes) -> list[dict]:
 
     Returns:
         A list of dicts, each with keys: date (YYYY-MM-DD), description (str),
-        amount (float). Only debit/charge lines (positive amounts) are included.
+        amount (float). Charges are positive; credits/refunds are negative.
+        BCP statements typically render charges in a "Cargos/Consumos" column
+        and credits in a separate "Abonos/Pagos" column. When two numeric
+        columns appear on the same row, the later (right-most) is treated as
+        the credit and its sign is flipped. A single numeric column is kept
+        with whatever sign ``_parse_amount`` returned (including parenthesized
+        or "CR"-suffixed credits).
 
     Raises:
         ValueError: If the PDF cannot be parsed or contains no valid data.
@@ -109,13 +139,9 @@ def parse_statement_pdf(pdf_source: str | bytes) -> list[dict]:
                     except ValueError:
                         continue
 
-                    # Extract description from the second column (or combined
-                    # middle columns)
-                    description_parts = []
-                    amount = None
+                    description_parts: list[str] = []
+                    numeric_values: list[float] = []
 
-                    # Walk columns after the date: collect text as description
-                    # until we find a parseable amount in the later columns
                     for cell in row[1:]:
                         cell_text = cell.strip() if cell else ""
                         if not cell_text:
@@ -123,13 +149,26 @@ def parse_statement_pdf(pdf_source: str | bytes) -> list[dict]:
 
                         parsed = _parse_amount(cell_text)
                         if parsed is not None:
-                            # Take the last valid amount in the row (typically
-                            # the debit or charge column)
-                            amount = parsed
+                            numeric_values.append(parsed)
                         else:
                             description_parts.append(cell_text)
 
-                    if amount is None or amount <= 0:
+                    if not numeric_values:
+                        continue
+
+                    if len(numeric_values) == 1:
+                        amount = numeric_values[0]
+                    else:
+                        # Two-column layout: charges first, credits second.
+                        # The non-zero column wins; if both are populated
+                        # (rare), the credit takes precedence and is negated.
+                        debit, credit = numeric_values[0], numeric_values[-1]
+                        if credit and abs(credit) > 0:
+                            amount = -abs(credit)
+                        else:
+                            amount = debit
+
+                    if amount == 0:
                         continue
 
                     description = " ".join(description_parts).strip()
