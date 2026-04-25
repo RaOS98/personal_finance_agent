@@ -12,17 +12,19 @@ An AI-powered agent that runs on Telegram. The user sends photos of receipts, tr
 
 ## How It Works
 
-1. **Capture** — Send a photo or text message to the Telegram bot with basic context (e.g., "Sapphire, groceries").
-2. **Extract** — Claude Sonnet reads the image and extracts merchant name, amount, date, and currency.
+1. **Route** — Free-form text messages are first classified into one of three intents: `new_transaction`, `edit`, or `query`. Photos always route directly to the new-transaction flow. The `!` and `?` prefixes force the edit and query flows respectively.
+2. **Capture** — For new transactions, send a photo or text message to the Telegram bot with basic context (e.g., "Sapphire, groceries"). Claude Sonnet reads the image and extracts merchant name, amount, date, and currency.
 3. **Confirm** — The agent replies with a structured summary for the user to approve or correct.
 4. **Store** — Confirmed transactions are saved to DynamoDB; receipt images go to S3.
-5. **Reconcile** — Monthly bank statement PDFs are uploaded. Python pre-filters by amount and date to find candidates, then the agent evaluates all candidates for a statement line in a single batched call. Matches are triaged into three tiers: Confident (auto-confirmed), Likely (quick user confirmation), and Uncertain (user review with context).
-6. **Visualize** — A local Streamlit dashboard backed by DynamoDB provides real-time visibility into spending by category, payment method, and time period.
+5. **Edit** — Send a natural-language correction (e.g., "change amount to 25") to update the most recent transaction. The bot shows a yes/no diff before any write.
+6. **Query** — Ask questions in plain English or Spanish (e.g., "how much did I spend on food this month?"). The agent runs a tool-use loop over DynamoDB and replies with cited transaction ids.
+7. **Reconcile** — Monthly bank statement PDFs are uploaded. Python pre-filters by amount and date to find candidates, then the agent evaluates all candidates for a statement line in a single batched call. Matches are triaged into three tiers: Confident (auto-confirmed), Likely (quick user confirmation), and Uncertain (user review with context).
+8. **Visualize** — A local Streamlit dashboard backed by DynamoDB provides real-time visibility into spending by category, payment method, and time period.
 
 ## Architecture
 
 - **Runtime**: AWS Lambda (python3.12, arm64), triggered by Telegram webhook via API Gateway HTTP API
-- **AI**: Amazon Bedrock — Claude Sonnet 4.6 for vision extraction, Claude Haiku 4.5 for categorization and reconciliation
+- **AI**: Amazon Bedrock — Claude Sonnet 4.6 for vision extraction, Claude Haiku 4.5 for intent classification, categorization, edit parsing, query tool-use, and reconciliation
 - **Database**: DynamoDB single-table design with two GSIs
 - **Storage**: S3 for receipt images (Standard → Standard-IA lifecycle)
 - **Secrets**: AWS SSM Parameter Store

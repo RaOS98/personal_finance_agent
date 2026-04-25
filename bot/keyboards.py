@@ -39,9 +39,9 @@ def edit_field_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-def category_keyboard() -> InlineKeyboardMarkup:
+def category_keyboard(prefix: str = "cat") -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(name, callback_data=f"cat_{slug}")]
+        [InlineKeyboardButton(name, callback_data=f"{prefix}_{slug}")]
         for name, slug in CATEGORIES
     ]
     return InlineKeyboardMarkup(buttons)

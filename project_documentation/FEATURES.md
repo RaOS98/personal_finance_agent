@@ -6,6 +6,26 @@ This document describes the features of the Personal Finance Agent, organized by
 
 ---
 
+## 0. Intent-Based Routing
+
+Free-form text messages are classified into one of three intents at the top of the message handler. The classifier (Claude Haiku 4.5) reads the message and returns one of:
+
+- `new_transaction` — log a new spend (default)
+- `edit` — modify a previously logged transaction
+- `query` — answer a question about historical transactions
+
+**Bypass conditions** (the classifier is skipped):
+- The message contains a photo — always treated as a new transaction.
+- The user is mid-flow (e.g., the bot is awaiting a missing field or category selection) — the existing state-machine handler runs instead.
+
+**Escape hatches** (override the classifier):
+- Prefix the message with `!` to force the edit flow (e.g., `!change merchant to Pedro`).
+- Prefix the message with `?` to force the query flow (e.g., `?balance this month`).
+
+**Failure mode:** The classifier fails open. Any error or unrecognized response defaults to `new_transaction`. The reasoning: missing a new transaction silently loses user data; misclassifying an edit/query just prompts a rephrase.
+
+---
+
 ## 1. Transaction Capture
 
 The primary feature of the system. The user logs transactions by sending messages to the Telegram bot.
@@ -109,11 +129,114 @@ Before saving, the system checks for potential duplicates: same amount, same dat
 
 ---
 
-## 3. Monthly Reconciliation
+## 3. Edit a Previously Logged Transaction
+
+Send a natural-language correction to update the most recent transaction. The bot always shows a yes/no diff before any database write — destructive operations never skip the confirmation step.
+
+### 3.1 Trigger
+
+The intent classifier routes messages like "change the last one to 30 soles" or "cambia el monto a 25" to the edit flow. Alternatively, prefix any message with `!` to force the edit flow regardless of phrasing (e.g., `!change merchant to Pedro`).
+
+### 3.2 Flow
+
+**User sends:**
+```
+change amount to 25
+```
+
+**Agent does:**
+1. Fetches the user's most recent transaction from DynamoDB.
+2. Parses the edit instruction with Claude Haiku 4.5 → `{field: "amount", new_value: 25.0, confident: true}`.
+3. Validates the new value (numeric for amount, ISO date for date, known slug for category, resolvable alias for payment method).
+
+**Bot replies:**
+```
+Update transaction #42: change amount from 30.0 to 25.0?
+  ✅ Yes    ❌ No
+```
+
+**User presses ✅ Yes:**
+- The transaction is updated in DynamoDB.
+- For `amount` and `date` edits, the underlying primary key (`SK = {date}#{txn_id:08d}`) and the GSI1 partition key (`AMT#{account_id}#{cents}`) are atomically rewritten via a `TransactWriteItems` (delete old + put new) call. `id`, `created_at`, `reconciliation_status`, and any image references are preserved verbatim.
+- For other fields, a plain `UpdateItem` rewrites the affected attributes.
+- The bot replies with the updated summary plus "✅ Updated."
+
+**User presses ❌ No:** The state is cleared, the bot replies "❌ Edit cancelled," and DynamoDB is untouched.
+
+### 3.3 Editable Fields
+
+| Field | Notes |
+|-------|-------|
+| `merchant` | Free string |
+| `description` | Free string |
+| `amount` | Coerced to float; key rewrite required |
+| `date` | ISO YYYY-MM-DD; key rewrite required |
+| `category_slug` | Must be one of the 12 standard slugs. If the model emits something unknown, the bot presents the category keyboard for the user to pick. |
+| `payment_method_id` | The model emits the alias verbatim (`yape`, `amex`, etc.); the handler resolves it via `db.resolve_payment_method`. |
+
+### 3.4 Out of Scope (v1)
+
+- Reference resolution to non-most-recent transactions (e.g., "my last Starbucks", "the 25 soles one from Tuesday").
+- Multi-field edits in one turn.
+
+These are deferred until real usage patterns are known.
+
+---
+
+## 4. Natural-Language Queries
+
+Ask questions about historical spending in plain English or Spanish. The query agent runs a tool-use loop over DynamoDB and replies with cited transaction ids so the user can verify any number it cites.
+
+### 4.1 Trigger
+
+The intent classifier routes messages like "how much did I spend on food this month?" or "cuanto gaste en uber esta semana" to the query flow. Prefix any message with `?` to force it (e.g., `?balance`).
+
+### 4.2 Flow
+
+**User sends:**
+```
+how much did I spend on food this month?
+```
+
+**Bot replies:** `Thinking…` (covers the 2–4 second latency).
+
+**Agent does:**
+1. Calls `get_today` to resolve "this month" → date range.
+2. Calls `aggregate_by_category(date_from, date_to)` (or `query_transactions(...)` filtered by `category_slug=food_dining`) to fetch the figures.
+3. Returns a final JSON envelope `{answer, source_txn_ids}`.
+
+**Bot replies:**
+```
+You spent S/. 312.50 on food this month across 8 transactions.
+
+Based on: #42, #47, #51, #55, #60, #63, #68, #71
+```
+
+### 4.3 Tool Surface
+
+The query agent has access to four tools:
+
+| Tool | Purpose |
+|------|---------|
+| `get_today()` | Returns today's ISO date so the model can resolve relative time phrases. |
+| `list_recent_transactions(limit)` | Fetches the N most recent transactions (capped at 50). |
+| `query_transactions(date_from, date_to, category_slug?, payment_method_alias?)` | Date-range query with optional filters; capped at 50 rows. |
+| `aggregate_by_category(date_from, date_to)` | Groups by category and sums per currency. |
+
+### 4.4 Limitations
+
+- Hard cap of 4 tool-use iterations per query — bounds worst-case latency.
+- Tool results capped at 50 rows. If the full result exceeded the cap, the model sees `truncated: true` and is instructed to communicate the limitation in its answer.
+- Stateless: the agent sees only the current question, not the prior conversation. Follow-up questions need to restate context.
+- Currency assumed to be PEN unless the user explicitly says USD or dollars.
+
+---
+
+## 5. Monthly Reconciliation
 
 At the end of each billing cycle, the user uploads bank statement PDFs for each active account/card. The system matches logged transactions against statement lines.
 
-### 3.1 Statement Upload
+### 5.1 Statement Upload
 
 **User sends:** A PDF file to the Telegram bot with a message identifying the account (e.g., "Sapphire statement April").
 
@@ -122,7 +245,7 @@ At the end of each billing cycle, the user uploads bank statement PDFs for each 
 2. Identifies the account from the user's message
 3. Stores the statement lines in DynamoDB (idempotent — re-uploading the same statement is safe)
 
-### 3.2 Matching Process
+### 5.2 Matching Process
 
 Reconciliation runs in two stages:
 
@@ -142,7 +265,7 @@ Reconciliation runs in two stages:
 | **Likely** | Probably the same | Sent to user for quick yes/no confirmation |
 | **Uncertain** | Unclear match | Sent to user with context for manual review |
 
-### 3.3 Reconciliation Review via Telegram
+### 5.3 Reconciliation Review via Telegram
 
 For Likely and Uncertain matches, the bot sends review requests:
 
@@ -178,7 +301,7 @@ For Likely and Uncertain matches, the bot sends review requests:
   ✅ Add    ⏭️ Skip
 ```
 
-### 3.4 Reconciliation Outcomes
+### 5.4 Reconciliation Outcomes
 
 After reconciliation, every statement line has one of these statuses:
 - **Matched** — linked to a logged transaction (auto or user-confirmed)
@@ -192,7 +315,7 @@ Every logged transaction has one of these statuses:
 
 ---
 
-## 4. Dashboard
+## 6. Dashboard
 
 A local Streamlit application providing real-time visibility into personal finances. Reads from DynamoDB — requires AWS credentials in the environment.
 
@@ -201,7 +324,7 @@ export AWS_PROFILE=your-profile AWS_REGION=us-east-1
 streamlit run dashboard/app.py
 ```
 
-### 4.1 Monthly Summary
+### 6.1 Monthly Summary
 
 The default view. Shows spending for a selected month:
 - Total spent (PEN and USD shown separately)
@@ -210,18 +333,18 @@ The default view. Shows spending for a selected month:
 - Spending by category (horizontal bar chart)
 - Spending by payment method (horizontal bar chart)
 
-### 4.2 Category Breakdown
+### 6.2 Category Breakdown
 
 Drill down into any category to see individual transactions. Filterable by date range and payment method.
 
-### 4.3 Trends
+### 6.3 Trends
 
 Monthly spending over time:
 - Total spending per month (line chart, by currency)
 - Per-category trends (line chart)
 - Selectable date range
 
-### 4.4 Reconciliation Status
+### 6.4 Reconciliation Status
 
 Overview of reconciliation health:
 - Reconciled vs. unreconciled transaction counts for the selected month
@@ -231,7 +354,7 @@ Overview of reconciliation health:
 
 ---
 
-## 5. Payment Method Shortcuts
+## 7. Payment Method Shortcuts
 
 To minimize typing, the bot recognizes short aliases for payment methods:
 
