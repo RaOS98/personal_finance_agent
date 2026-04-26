@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import date
 from typing import Any
 
 import boto3
@@ -94,6 +95,7 @@ def parse_edit_request(text: str, target_txn: dict[str, Any]) -> dict:
     system = [
         {"text": SYSTEM_PROMPT},
         {"cachePoint": {"type": "default"}},
+        {"text": f"Today's date is {date.today().isoformat()}. Use this to resolve relative expressions like 'yesterday', 'today', 'last Tuesday', or 'next Friday'."},
     ]
 
     for attempt in range(2):

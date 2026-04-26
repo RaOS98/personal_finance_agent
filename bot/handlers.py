@@ -24,6 +24,8 @@ from bot.keyboards import (
     confirmation_keyboard,
     edit_field_keyboard,
     category_keyboard,
+    currency_keyboard,
+    back_button_keyboard,
     yes_no_keyboard,
     reconciliation_candidates_keyboard,
     add_skip_keyboard,
@@ -55,6 +57,23 @@ def _persist(user_id: int, state: dict) -> None:
 def _mark_cleared(state: dict) -> None:
     state.clear()
     state["__cleared__"] = True
+
+
+async def _clear_prompt_keyboard(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    msg_id: int | None,
+) -> None:
+    """Strip the inline keyboard off a prior prompt message so its 🔙 Back
+    button can't be tapped after the user has already moved past that step."""
+    if not msg_id:
+        return
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=chat_id, message_id=msg_id, reply_markup=None
+        )
+    except Exception:
+        logger.debug("Could not clear keyboard on msg %s", msg_id)
 
 
 def _is_allowed(user_id: int) -> bool:
@@ -406,6 +425,8 @@ async def _handle_edit_value(
 
     if field == "merchant":
         txn["merchant"] = value
+    elif field == "description":
+        txn["description"] = value
     elif field == "amount":
         try:
             txn["amount"] = float(value)
@@ -413,13 +434,14 @@ async def _handle_edit_value(
             await update.message.reply_text("Please enter a valid number.")
             return
     elif field == "date":
-        txn["date"] = value
-    elif field == "category":
-        state["state"] = "awaiting_category_select"
-        await update.message.reply_text(
-            "Choose a category:", reply_markup=category_keyboard()
-        )
-        return
+        try:
+            txn["date"] = _coerce_txn_date(value).isoformat()
+        except (TypeError, ValueError):
+            await update.message.reply_text(
+                "I couldn't read that date. Use ISO format (YYYY-MM-DD), e.g. 2026-04-26.",
+                reply_markup=back_button_keyboard("editvalue_back"),
+            )
+            return
     elif field == "payment_method":
         pm = db.resolve_payment_method(value)
         if pm:
@@ -431,6 +453,11 @@ async def _handle_edit_value(
             )
             return
 
+    await _clear_prompt_keyboard(
+        context,
+        chat_id=update.effective_chat.id,
+        msg_id=state.pop("edit_prompt_msg_id", None),
+    )
     state["state"] = "awaiting_confirmation"
     await update.message.reply_text(
         format_transaction_summary(txn),
@@ -456,6 +483,8 @@ async def _handle_stored_edit_value(
 
     if field == "merchant":
         snapshot["merchant"] = value
+    elif field == "description":
+        snapshot["description"] = value
     elif field == "amount":
         try:
             snapshot["amount"] = float(value)
@@ -467,7 +496,8 @@ async def _handle_stored_edit_value(
             snapshot["date"] = _coerce_txn_date(value).isoformat()
         except (TypeError, ValueError):
             await update.message.reply_text(
-                "I couldn't read that date. Use ISO format (YYYY-MM-DD)."
+                "I couldn't read that date. Use ISO format (YYYY-MM-DD), e.g. 2026-04-26.",
+                reply_markup=back_button_keyboard("storededitvalue_back"),
             )
             return
     elif field == "payment_method":
@@ -485,6 +515,11 @@ async def _handle_stored_edit_value(
         _mark_cleared(state)
         return
 
+    await _clear_prompt_keyboard(
+        context,
+        chat_id=update.effective_chat.id,
+        msg_id=state.pop("stored_edit_prompt_msg_id", None),
+    )
     state["state"] = "awaiting_stored_edit_confirm"
     state.pop("stored_edit_field", None)
     await update.message.reply_text(
@@ -702,15 +737,118 @@ async def _handle_callback_inner(
 
     if data.startswith("edit_"):
         field = data.removeprefix("edit_")
-        if field == "category":
-            state["state"] = "awaiting_category_select"
+        if field == "back":
+            if not txn:
+                await query.edit_message_text("No pending transaction.")
+                _mark_cleared(state)
+                return
+            state["state"] = "awaiting_confirmation"
+            state.pop("edit_field", None)
             await query.edit_message_text(
-                "Choose a category:", reply_markup=category_keyboard()
+                format_transaction_summary(txn),
+                reply_markup=confirmation_keyboard(),
+            )
+            return
+        if field == "category":
+            state["state"] = "awaiting_edit_category"
+            await query.edit_message_text(
+                "Choose a category:",
+                reply_markup=category_keyboard(
+                    prefix="editcat", back_data="editcat_back"
+                ),
+            )
+            return
+        if field == "currency":
+            state["state"] = "awaiting_edit_currency"
+            await query.edit_message_text(
+                "Choose a currency:",
+                reply_markup=currency_keyboard(prefix="editcur"),
             )
             return
         state["state"] = "awaiting_edit_value"
         state["edit_field"] = field
-        await query.edit_message_text(f"Enter the new value for {field}:")
+        prompt_text = (
+            "Enter the new date (YYYY-MM-DD, e.g. 2026-04-26):"
+            if field == "date"
+            else f"Enter the new value for {field}:"
+        )
+        await query.edit_message_text(
+            prompt_text,
+            reply_markup=back_button_keyboard("editvalue_back"),
+        )
+        state["edit_prompt_msg_id"] = query.message.message_id
+        return
+
+    if data == "editvalue_back":
+        state["state"] = "awaiting_edit_field"
+        state.pop("edit_field", None)
+        state.pop("edit_prompt_msg_id", None)
+        await query.edit_message_text(
+            "Which field do you want to edit?",
+            reply_markup=edit_field_keyboard(),
+        )
+        return
+
+    if data.startswith("editcur_"):
+        suffix = data.removeprefix("editcur_")
+        if suffix == "back":
+            state["state"] = "awaiting_edit_field"
+            await query.edit_message_text(
+                "Which field do you want to edit?",
+                reply_markup=edit_field_keyboard(),
+            )
+            return
+        if txn is None:
+            await query.edit_message_text("No pending transaction.")
+            _mark_cleared(state)
+            return
+        if suffix not in ("PEN", "USD"):
+            await query.edit_message_text("Unknown currency.")
+            return
+        txn["currency"] = suffix
+        state["state"] = "awaiting_confirmation"
+        await query.edit_message_text(
+            format_transaction_summary(txn),
+            reply_markup=confirmation_keyboard(),
+        )
+        return
+
+    if data.startswith("editcat_"):
+        suffix = data.removeprefix("editcat_")
+        if suffix == "back":
+            state["state"] = "awaiting_edit_field"
+            await query.edit_message_text(
+                "Which field do you want to edit?",
+                reply_markup=edit_field_keyboard(),
+            )
+            return
+        if txn is None:
+            await query.edit_message_text("No pending transaction.")
+            _mark_cleared(state)
+            return
+        if suffix not in CATEGORY_NAME_BY_SLUG:
+            await query.edit_message_text("Unknown category.")
+            return
+        txn["category_slug"] = suffix
+        txn["category_name"] = CATEGORY_NAME_BY_SLUG.get(suffix, suffix)
+        txn["needs_description"] = suffix == "other"
+
+        if txn["needs_description"] and not txn.get("description"):
+            state["state"] = "awaiting_missing_field"
+            state["missing_field"] = "description"
+            await query.edit_message_text(
+                'Category set to "Other". Please provide a brief description:'
+            )
+            return
+
+        if not txn.get("date"):
+            txn["date"] = date.today().isoformat()
+
+        state["state"] = "awaiting_confirmation"
+        await query.edit_message_text(
+            format_transaction_summary(txn),
+            reply_markup=confirmation_keyboard(),
+        )
         return
 
     if data.startswith("cat_"):
@@ -779,30 +917,110 @@ async def _handle_callback_inner(
             _mark_cleared(state)
             return
         field = data.removeprefix("storededitfield_")
+        if field == "back":
+            state["state"] = "awaiting_stored_edit_confirm"
+            state.pop("stored_edit_field", None)
+            await query.edit_message_text(
+                format_transaction_summary(state["edit_snapshot"]),
+                reply_markup=confirmation_keyboard(prefix="storededit"),
+            )
+            return
         if field == "category":
             state["state"] = "awaiting_stored_edit_category"
             await query.edit_message_text(
                 "Choose a category:",
-                reply_markup=category_keyboard(prefix="storededitcat"),
+                reply_markup=category_keyboard(
+                    prefix="storededitcat", back_data="storededitcat_back"
+                ),
+            )
+            return
+        if field == "currency":
+            state["state"] = "awaiting_stored_edit_currency"
+            await query.edit_message_text(
+                "Choose a currency:",
+                reply_markup=currency_keyboard(prefix="storededitcur"),
             )
             return
         state["state"] = "awaiting_stored_edit_value"
         state["stored_edit_field"] = field
-        await query.edit_message_text(f"Enter the new value for {field}:")
+        prompt_text = (
+            "Enter the new date (YYYY-MM-DD, e.g. 2026-04-26):"
+            if field == "date"
+            else f"Enter the new value for {field}:"
+        )
+        await query.edit_message_text(
+            prompt_text,
+            reply_markup=back_button_keyboard("storededitvalue_back"),
+        )
+        state["stored_edit_prompt_msg_id"] = query.message.message_id
         return
 
-    if data.startswith("storededitcat_"):
-        slug = data.removeprefix("storededitcat_")
-        if slug not in CATEGORY_NAME_BY_SLUG:
-            await query.edit_message_text("Unknown category.")
+    if data == "storededitvalue_back":
+        if state.get("edit_snapshot") is None:
+            await query.edit_message_text("No edit in progress.")
+            _mark_cleared(state)
             return
+        state["state"] = "awaiting_stored_edit_field"
+        state.pop("stored_edit_field", None)
+        state.pop("stored_edit_prompt_msg_id", None)
+        await query.edit_message_text(
+            "Which field do you want to edit?",
+            reply_markup=edit_field_keyboard(prefix="storededitfield"),
+        )
+        return
+
+    if data.startswith("storededitcur_"):
+        suffix = data.removeprefix("storededitcur_")
         snapshot = state.get("edit_snapshot")
+        if suffix == "back":
+            if snapshot is None:
+                await query.edit_message_text("No edit in progress.")
+                _mark_cleared(state)
+                return
+            state["state"] = "awaiting_stored_edit_field"
+            await query.edit_message_text(
+                "Which field do you want to edit?",
+                reply_markup=edit_field_keyboard(prefix="storededitfield"),
+            )
+            return
         if snapshot is None:
             await query.edit_message_text("No edit in progress.")
             _mark_cleared(state)
             return
-        snapshot["category_slug"] = slug
-        snapshot["category_name"] = CATEGORY_NAME_BY_SLUG.get(slug, slug)
+        if suffix not in ("PEN", "USD"):
+            await query.edit_message_text("Unknown currency.")
+            return
+        snapshot["currency"] = suffix
+        state["state"] = "awaiting_stored_edit_confirm"
+        await query.edit_message_text(
+            format_transaction_summary(snapshot),
+            reply_markup=confirmation_keyboard(prefix="storededit"),
+        )
+        return
+
+    if data.startswith("storededitcat_"):
+        suffix = data.removeprefix("storededitcat_")
+        snapshot = state.get("edit_snapshot")
+        if suffix == "back":
+            if snapshot is None:
+                await query.edit_message_text("No edit in progress.")
+                _mark_cleared(state)
+                return
+            state["state"] = "awaiting_stored_edit_field"
+            await query.edit_message_text(
+                "Which field do you want to edit?",
+                reply_markup=edit_field_keyboard(prefix="storededitfield"),
+            )
+            return
+        if suffix not in CATEGORY_NAME_BY_SLUG:
+            await query.edit_message_text("Unknown category.")
+            return
+        if snapshot is None:
+            await query.edit_message_text("No edit in progress.")
+            _mark_cleared(state)
+            return
+        snapshot["category_slug"] = suffix
+        snapshot["category_name"] = CATEGORY_NAME_BY_SLUG.get(suffix, suffix)
 
         state["state"] = "awaiting_stored_edit_confirm"
         await query.edit_message_text(
@@ -939,6 +1157,7 @@ async def _apply_stored_edit(query, state: dict) -> None:
         "merchant",
         "description",
         "amount",
+        "currency",
         "date",
         "category_slug",
         "payment_method_id",

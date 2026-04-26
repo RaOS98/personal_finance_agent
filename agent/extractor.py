@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import date
 from typing import Any
 
 import boto3
@@ -115,6 +116,7 @@ def extract_transaction(image_bytes: bytes | None, user_message: str) -> dict:
     system = [
         {"text": SYSTEM_PROMPT},
         {"cachePoint": {"type": "default"}},
+        {"text": f"Today's date is {date.today().isoformat()}. When a receipt shows a partial date (e.g., MM/DD without a year), prefer the most recent past or current year — receipts are typically photographed within days of the purchase."},
     ]
 
     for attempt in range(2):
