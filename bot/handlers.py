@@ -1,4 +1,14 @@
-"""Telegram bot handlers (serverless / DynamoDB + S3 backed)."""
+"""Telegram bot handlers (serverless / DynamoDB + S3 backed).
+
+Two state surfaces in DynamoDB:
+- ``STATE#<user>/current`` — global single-track flows: stored-tx edit (``!``
+  intent) and statement reconciliation. Loaded/persisted by every handler call.
+- ``STATE#<user>/PENDING#<id>`` — one per in-flight new-tx flow, so multiple
+  receipts can be confirmed/edited in any order. Each callback button carries
+  its pending id as ``<action>:<id>``; typed replies are routed via a
+  ``STATE#<user>/REPLY#<prompt_msg_id>`` lookup that points back to the right
+  pending.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +16,7 @@ import logging
 import re
 from datetime import datetime, date
 
-from telegram import Update
+from telegram import Update, ForceReply
 from telegram.ext import ContextTypes
 
 import config
@@ -36,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# State management (DynamoDB-backed)
+# Global state (stored-edit + reconciliation)
 # ---------------------------------------------------------------------------
 
 def _load_state(user_id: int) -> dict:
@@ -44,14 +54,10 @@ def _load_state(user_id: int) -> dict:
 
 
 def _persist(user_id: int, state: dict) -> None:
-    """Save at end of a handler invocation, or delete if marked cleared."""
     if state.pop("__cleared__", False):
         db.clear_user_state(user_id)
     elif state:
         db.save_user_state(user_id, state)
-    else:
-        # Nothing to save and nothing to clear — leave any existing state alone.
-        pass
 
 
 def _mark_cleared(state: dict) -> None:
@@ -64,8 +70,6 @@ async def _clear_prompt_keyboard(
     chat_id: int,
     msg_id: int | None,
 ) -> None:
-    """Strip the inline keyboard off a prior prompt message so its 🔙 Back
-    button can't be tapped after the user has already moved past that step."""
     if not msg_id:
         return
     try:
@@ -78,6 +82,15 @@ async def _clear_prompt_keyboard(
 
 def _is_allowed(user_id: int) -> bool:
     return user_id == config.ALLOWED_USER_ID
+
+
+def _parse_callback(data: str) -> tuple[str, int | None]:
+    """Split ``action:42`` into ``("action", 42)``. Falls back to ``(data, None)``."""
+    if ":" in data:
+        action, _, id_str = data.rpartition(":")
+        if action and id_str.isdigit():
+            return action, int(id_str)
+    return data, None
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +200,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ---------------------------------------------------------------------------
-# Top-level handlers (persist state at the end of each invocation)
+# Top-level handlers
 # ---------------------------------------------------------------------------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -232,7 +245,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ---------------------------------------------------------------------------
-# Main text/photo flow
+# Main message flow
 # ---------------------------------------------------------------------------
 
 async def _handle_message_inner(
@@ -241,21 +254,23 @@ async def _handle_message_inner(
     state: dict,
     user_id: int,
 ) -> None:
+    # 1. Reply-to routing — typed value for some pending tx
+    reply_to = update.message.reply_to_message
+    if reply_to and update.message.text:
+        lookup = db.load_reply_lookup(user_id, reply_to.message_id)
+        if lookup:
+            await _handle_reply_value(update, context, user_id, lookup)
+            return
+        # else: stale prompt, fall through
+
     current = state.get("state")
 
-    if current == "awaiting_edit_value":
-        await _handle_edit_value(update, context, state)
-        return
-
+    # 2. Stored-edit typed value (single-track on global state)
     if current == "awaiting_stored_edit_value":
         await _handle_stored_edit_value(update, context, state)
         return
 
-    if current == "awaiting_missing_field":
-        await _handle_missing_field(update, context, state)
-        return
-
-    # --- Intent routing: only for non-photo, free-form text messages --------
+    # 3. Intent routing for free-form text
     text = update.message.text or update.message.caption or ""
 
     if not update.message.photo and text.strip():
@@ -282,7 +297,20 @@ async def _handle_message_inner(
             return
         # new_transaction → fall through
 
-    # --- New transaction from text or photo ---------------------------------
+    # 4. New-transaction (text or photo) → start a new pending flow
+    await _start_new_pending_flow(update, context, user_id, text)
+
+
+# ---------------------------------------------------------------------------
+# Start a new pending flow
+# ---------------------------------------------------------------------------
+
+async def _start_new_pending_flow(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    text: str,
+) -> None:
     image_bytes = None
     telegram_image_id = None
     tmp_s3_key = None
@@ -294,7 +322,6 @@ async def _handle_message_inner(
         image_bytes = bytes(await photo_file.download_as_bytearray())
         tmp_s3_key = s3_store.upload_tmp_image(user_id, image_bytes)
 
-    # 1. Extract transaction data
     try:
         extracted = extractor.extract_transaction(image_bytes, text)
     except Exception:
@@ -315,12 +342,8 @@ async def _handle_message_inner(
         )
         return
 
-    # 2. Resolve payment method
     alias = extracted.get("payment_method_alias")
-    pm = None
-    if alias:
-        pm = db.resolve_payment_method(alias)
-
+    pm = db.resolve_payment_method(alias) if alias else None
     if pm:
         extracted["payment_method_id"] = pm["id"]
         extracted["payment_method_name"] = pm["name"]
@@ -328,7 +351,6 @@ async def _handle_message_inner(
         extracted["payment_method_id"] = None
         extracted["payment_method_name"] = None
 
-    # 3. Categorize
     try:
         cat_result = categorizer.categorize_transaction(
             merchant=extracted.get("merchant"),
@@ -341,10 +363,9 @@ async def _handle_message_inner(
         cat_result = {"category_slug": None, "confident": False, "needs_description": False}
 
     extracted["category_slug"] = cat_result.get("category_slug")
-    extracted["category_name"] = CATEGORY_NAME_BY_SLUG.get(
-        cat_result.get("category_slug"), None
-    )
+    extracted["category_name"] = CATEGORY_NAME_BY_SLUG.get(cat_result.get("category_slug"))
     extracted["needs_description"] = cat_result.get("needs_description", False)
+    extracted["confident_category"] = bool(cat_result.get("confident"))
 
     if not extracted.get("description") and extracted.get("category_hint"):
         extracted["description"] = extracted["category_hint"]
@@ -353,76 +374,220 @@ async def _handle_message_inner(
     if tmp_s3_key:
         extracted["tmp_s3_key"] = tmp_s3_key
 
-    # 4. Missing critical fields
-    if extracted.get("amount") is None:
-        state["state"] = "awaiting_missing_field"
-        state["missing_field"] = "amount"
-        state["pending_txn"] = extracted
-        await update.message.reply_text("What is the transaction amount?")
-        return
+    await _present_step_new(update.message, context, user_id, None, extracted)
 
-    if extracted.get("currency") is None:
-        state["state"] = "awaiting_missing_field"
-        state["missing_field"] = "currency"
-        state["pending_txn"] = extracted
-        await update.message.reply_text(
-            "What currency? (PEN for soles, USD for dollars)"
+
+# ---------------------------------------------------------------------------
+# Step computation + rendering
+# ---------------------------------------------------------------------------
+
+def _next_step(txn: dict) -> dict:
+    """Return a descriptor of the next step needed."""
+    if txn.get("amount") is None:
+        return {
+            "kind": "force_reply",
+            "field": "amount",
+            "text": "What is the transaction amount?",
+        }
+    if txn.get("currency") is None:
+        return {
+            "kind": "force_reply",
+            "field": "currency",
+            "text": "What currency? (PEN for soles, USD for dollars)",
+        }
+    if txn.get("payment_method_id") is None:
+        return {
+            "kind": "force_reply",
+            "field": "payment_method",
+            "text": "Which payment method did you use? "
+                    "(e.g. sapphire, amex, yape, cash)",
+        }
+    if not txn.get("confident_category") or txn.get("category_slug") is None:
+        return {
+            "kind": "category_select",
+            "text": "I am not sure about the category. Please choose one:",
+        }
+    if txn.get("needs_description") and not txn.get("description"):
+        return {
+            "kind": "force_reply",
+            "field": "description",
+            "text": 'The category is "Other". Please provide a brief description:',
+        }
+    if not txn.get("date"):
+        txn["date"] = date.today().isoformat()
+    return {"kind": "summary"}
+
+
+async def _present_step_new(
+    reply_target,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    pending_id: int | None,
+    txn: dict,
+) -> int:
+    """Present the next step by sending a NEW message (no source to edit).
+
+    Used on initial extraction and after typed replies. Returns the
+    (possibly newly-assigned) pending_id.
+    """
+    chat_id = reply_target.chat_id if hasattr(reply_target, "chat_id") else reply_target.chat.id
+    step = _next_step(txn)
+
+    if step["kind"] == "force_reply":
+        msg = await reply_target.reply_text(
+            step["text"], reply_markup=ForceReply(selective=True)
         )
-        return
+        new_pid = pending_id if pending_id is not None else msg.message_id
+        db.save_pending_transaction(user_id, new_pid, {
+            "state": "awaiting_missing_field",
+            "missing_field": step["field"],
+            "txn": txn,
+        })
+        db.save_reply_lookup(user_id, msg.message_id, {
+            "pending_id": new_pid, "kind": "missing", "field": step["field"],
+        })
+        return new_pid
 
-    if extracted.get("payment_method_id") is None:
-        state["state"] = "awaiting_missing_field"
-        state["missing_field"] = "payment_method"
-        state["pending_txn"] = extracted
-        await update.message.reply_text(
-            "Which payment method did you use? "
-            "(e.g. sapphire, amex, yape, cash)"
+    if step["kind"] == "category_select":
+        if pending_id is not None:
+            kb = category_keyboard(prefix="cat", tx_id=pending_id)
+            await reply_target.reply_text(step["text"], reply_markup=kb)
+            new_pid = pending_id
+        else:
+            msg = await reply_target.reply_text(step["text"])
+            new_pid = msg.message_id
+            kb = category_keyboard(prefix="cat", tx_id=new_pid)
+            await context.bot.edit_message_reply_markup(
+                chat_id=chat_id, message_id=msg.message_id, reply_markup=kb,
+            )
+        db.save_pending_transaction(user_id, new_pid, {
+            "state": "awaiting_category_select", "txn": txn,
+        })
+        return new_pid
+
+    # summary
+    summary = format_transaction_summary(txn)
+    if pending_id is not None:
+        kb = confirmation_keyboard(tx_id=pending_id)
+        await reply_target.reply_text(summary, reply_markup=kb)
+        new_pid = pending_id
+    else:
+        msg = await reply_target.reply_text(summary)
+        new_pid = msg.message_id
+        kb = confirmation_keyboard(tx_id=new_pid)
+        await context.bot.edit_message_reply_markup(
+            chat_id=chat_id, message_id=msg.message_id, reply_markup=kb,
         )
-        return
+    db.save_pending_transaction(user_id, new_pid, {
+        "state": "awaiting_confirmation", "txn": txn,
+    })
+    return new_pid
 
-    # 5. Category confidence
-    if not cat_result.get("confident") or extracted.get("category_slug") is None:
-        state["state"] = "awaiting_category_select"
-        state["pending_txn"] = extracted
-        await update.message.reply_text(
-            "I am not sure about the category. Please choose one:",
-            reply_markup=category_keyboard(),
+
+async def _present_step_after_callback(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    pending_id: int,
+    txn: dict,
+) -> None:
+    """Advance the flow after a callback. Edits the source message in place
+    when the next step has a keyboard; for typed prompts, strips the source's
+    keyboard and sends a new ForceReply message."""
+    step = _next_step(txn)
+
+    if step["kind"] == "force_reply":
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            logger.debug("Could not strip keyboard on source message")
+        msg = await query.message.reply_text(
+            step["text"], reply_markup=ForceReply(selective=True)
         )
+        db.save_pending_transaction(user_id, pending_id, {
+            "state": "awaiting_missing_field",
+            "missing_field": step["field"],
+            "txn": txn,
+        })
+        db.save_reply_lookup(user_id, msg.message_id, {
+            "pending_id": pending_id, "kind": "missing", "field": step["field"],
+        })
         return
 
-    # 6. Needs description
-    if extracted.get("needs_description") and not extracted.get("description"):
-        state["state"] = "awaiting_missing_field"
-        state["missing_field"] = "description"
-        state["pending_txn"] = extracted
+    if step["kind"] == "category_select":
+        kb = category_keyboard(prefix="cat", tx_id=pending_id)
+        await query.edit_message_text(step["text"], reply_markup=kb)
+        db.save_pending_transaction(user_id, pending_id, {
+            "state": "awaiting_category_select", "txn": txn,
+        })
+        return
+
+    # summary
+    await query.edit_message_text(
+        format_transaction_summary(txn),
+        reply_markup=confirmation_keyboard(tx_id=pending_id),
+    )
+    db.save_pending_transaction(user_id, pending_id, {
+        "state": "awaiting_confirmation", "txn": txn,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Reply-to routing
+# ---------------------------------------------------------------------------
+
+async def _handle_reply_value(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    lookup: dict,
+) -> None:
+    pending_id = int(lookup["pending_id"])
+    kind = lookup.get("kind")
+    field = lookup.get("field")
+
+    pending = db.load_pending_transaction(user_id, pending_id)
+    if not pending:
+        await update.message.reply_text("That transaction has expired.")
+        db.delete_reply_lookup(user_id, update.message.reply_to_message.message_id)
+        return
+
+    txn = pending.get("txn") or {}
+    value = (update.message.text or "").strip()
+
+    error = _apply_value_to_txn(txn, field, value)
+    if error:
+        await update.message.reply_text(error)
+        return
+
+    db.delete_reply_lookup(user_id, update.message.reply_to_message.message_id)
+
+    if kind == "edit":
+        # Edit flow: jump straight back to the summary
+        kb = confirmation_keyboard(tx_id=pending_id)
         await update.message.reply_text(
-            'The category is "Other". Please provide a brief description:'
+            format_transaction_summary(txn), reply_markup=kb
         )
+        # Strip keyboard from the prior edit-prompt source if we tracked it.
+        prompt_msg_id = pending.get("edit_prompt_msg_id")
+        if prompt_msg_id:
+            await _clear_prompt_keyboard(
+                context, update.effective_chat.id, prompt_msg_id
+            )
+        db.save_pending_transaction(user_id, pending_id, {
+            "state": "awaiting_confirmation", "txn": txn,
+        })
         return
 
-    # 7. Default date
-    if not extracted.get("date"):
-        extracted["date"] = date.today().isoformat()
-
-    # 8. Present confirmation
-    state["state"] = "awaiting_confirmation"
-    state["pending_txn"] = extracted
-
-    await update.message.reply_text(
-        format_transaction_summary(extracted),
-        reply_markup=confirmation_keyboard(),
+    # Missing-field flow: continue to the next step
+    await _present_step_new(
+        update.message, context, user_id, pending_id, txn
     )
 
 
-async def _handle_edit_value(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    state: dict,
-) -> None:
-    field = state.get("edit_field")
-    value = update.message.text.strip()
-    txn = state["pending_txn"]
-
+def _apply_value_to_txn(txn: dict, field: str | None, value: str) -> str | None:
+    """Apply a typed value to txn in place. Returns an error message string
+    if the input is invalid, otherwise None."""
     if field == "merchant":
         txn["merchant"] = value
     elif field == "description":
@@ -431,48 +596,40 @@ async def _handle_edit_value(
         try:
             txn["amount"] = float(value)
         except ValueError:
-            await update.message.reply_text("Please enter a valid number.")
-            return
+            return "Please enter a valid number."
+    elif field == "currency":
+        upper = value.upper()
+        if upper not in ("PEN", "USD"):
+            return "Please enter PEN or USD."
+        txn["currency"] = upper
     elif field == "date":
         try:
             txn["date"] = _coerce_txn_date(value).isoformat()
         except (TypeError, ValueError):
-            await update.message.reply_text(
-                "I couldn't read that date. Use ISO format (YYYY-MM-DD), e.g. 2026-04-26.",
-                reply_markup=back_button_keyboard("editvalue_back"),
+            return (
+                "I couldn't read that date. Use ISO format (YYYY-MM-DD), "
+                "e.g. 2026-04-26."
             )
-            return
     elif field == "payment_method":
         pm = db.resolve_payment_method(value)
-        if pm:
-            txn["payment_method_id"] = pm["id"]
-            txn["payment_method_name"] = pm["name"]
-        else:
-            await update.message.reply_text(
-                "Payment method not recognized. Try: sapphire, amex, yape, cash"
-            )
-            return
+        if not pm:
+            return "Payment method not recognized. Try: sapphire, amex, yape, cash"
+        txn["payment_method_id"] = pm["id"]
+        txn["payment_method_name"] = pm["name"]
+    else:
+        return "Unknown field; cannot apply."
+    return None
 
-    await _clear_prompt_keyboard(
-        context,
-        chat_id=update.effective_chat.id,
-        msg_id=state.pop("edit_prompt_msg_id", None),
-    )
-    state["state"] = "awaiting_confirmation"
-    await update.message.reply_text(
-        format_transaction_summary(txn),
-        reply_markup=confirmation_keyboard(),
-    )
 
+# ---------------------------------------------------------------------------
+# Stored-edit (saved tx) typed value — single-track on global state
+# ---------------------------------------------------------------------------
 
 async def _handle_stored_edit_value(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     state: dict,
 ) -> None:
-    """Apply a typed value to the in-progress edit snapshot, then re-show
-    the summary + edit confirmation keyboard so the user can iterate.
-    """
     field = state.get("stored_edit_field")
     value = update.message.text.strip()
     snapshot = state.get("edit_snapshot")
@@ -481,38 +638,9 @@ async def _handle_stored_edit_value(
         _mark_cleared(state)
         return
 
-    if field == "merchant":
-        snapshot["merchant"] = value
-    elif field == "description":
-        snapshot["description"] = value
-    elif field == "amount":
-        try:
-            snapshot["amount"] = float(value)
-        except ValueError:
-            await update.message.reply_text("Please enter a valid number.")
-            return
-    elif field == "date":
-        try:
-            snapshot["date"] = _coerce_txn_date(value).isoformat()
-        except (TypeError, ValueError):
-            await update.message.reply_text(
-                "I couldn't read that date. Use ISO format (YYYY-MM-DD), e.g. 2026-04-26.",
-                reply_markup=back_button_keyboard("storededitvalue_back"),
-            )
-            return
-    elif field == "payment_method":
-        pm = db.resolve_payment_method(value)
-        if pm:
-            snapshot["payment_method_id"] = pm["id"]
-            snapshot["payment_method_name"] = pm["name"]
-        else:
-            await update.message.reply_text(
-                "Payment method not recognized. Try: sapphire, amex, yape, cash"
-            )
-            return
-    else:
-        await update.message.reply_text("Unknown field; edit cancelled.")
-        _mark_cleared(state)
+    error = _apply_value_to_txn(snapshot, field, value)
+    if error:
+        await update.message.reply_text(error)
         return
 
     await _clear_prompt_keyboard(
@@ -528,92 +656,8 @@ async def _handle_stored_edit_value(
     )
 
 
-async def _handle_missing_field(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    state: dict,
-) -> None:
-    field = state.get("missing_field")
-    text = update.message.text if update.message else None
-    if not text:
-        await update.message.reply_text(
-            "Please reply with a text value for this field."
-        )
-        return
-    value = text.strip()
-    txn = state["pending_txn"]
-
-    if field == "amount":
-        try:
-            txn["amount"] = float(value)
-        except ValueError:
-            await update.message.reply_text("Please enter a valid number.")
-            return
-    elif field == "currency":
-        upper = value.upper()
-        if upper not in ("PEN", "USD"):
-            await update.message.reply_text("Please enter PEN or USD.")
-            return
-        txn["currency"] = upper
-    elif field == "payment_method":
-        pm = db.resolve_payment_method(value)
-        if pm:
-            txn["payment_method_id"] = pm["id"]
-            txn["payment_method_name"] = pm["name"]
-        else:
-            await update.message.reply_text(
-                "Payment method not recognized. Try: sapphire, amex, yape, cash"
-            )
-            return
-    elif field == "description":
-        txn["description"] = value
-
-    if txn.get("amount") is None:
-        state["missing_field"] = "amount"
-        await update.message.reply_text("What is the transaction amount?")
-        return
-
-    if txn.get("currency") is None:
-        state["missing_field"] = "currency"
-        await update.message.reply_text(
-            "What currency? (PEN for soles, USD for dollars)"
-        )
-        return
-
-    if txn.get("payment_method_id") is None:
-        state["missing_field"] = "payment_method"
-        await update.message.reply_text(
-            "Which payment method did you use? "
-            "(e.g. sapphire, amex, yape, cash)"
-        )
-        return
-
-    if txn.get("category_slug") is None:
-        state["state"] = "awaiting_category_select"
-        await update.message.reply_text(
-            "Please choose a category:", reply_markup=category_keyboard()
-        )
-        return
-
-    if txn.get("needs_description") and not txn.get("description"):
-        state["missing_field"] = "description"
-        await update.message.reply_text(
-            'The category is "Other". Please provide a brief description:'
-        )
-        return
-
-    if not txn.get("date"):
-        txn["date"] = date.today().isoformat()
-
-    state["state"] = "awaiting_confirmation"
-    await update.message.reply_text(
-        format_transaction_summary(txn),
-        reply_markup=confirmation_keyboard(),
-    )
-
-
 # ---------------------------------------------------------------------------
-# Edit / query intents
+# Edit / query intents (operate on saved transactions)
 # ---------------------------------------------------------------------------
 
 async def _handle_edit_intent(
@@ -623,13 +667,6 @@ async def _handle_edit_intent(
     user_id: int,
     text: str,
 ) -> None:
-    """Open the keyboard-based editor for the most recent transaction.
-
-    Snapshots the target into state so the user can iterate (pick field →
-    set value → return to summary) and saves all changes in one DynamoDB
-    write when they confirm. The message text is intentionally ignored —
-    the inline UI handles all input.
-    """
     recent = db.list_recent_transactions(limit=1)
     if not recent:
         await update.message.reply_text("No recent transactions to edit.")
@@ -692,204 +729,335 @@ async def _handle_callback_inner(
     user_id: int,
 ) -> None:
     query = update.callback_query
-    data = query.data
-    txn = state.get("pending_txn")
+    action, pending_id = _parse_callback(query.data)
 
-    if data == "txn_confirm":
-        if not txn:
-            await query.edit_message_text("No pending transaction found.")
-            return
-        duplicates = db.check_duplicate_transaction(
-            amount=txn["amount"],
-            date_val=_coerce_txn_date(txn["date"]),
-            payment_method_id=txn["payment_method_id"],
-        )
-        if duplicates:
-            state["state"] = "awaiting_duplicate_confirm"
-            dup_info = "\n".join(
-                f"  - {d.get('merchant', '?')} on {d.get('date')} "
-                f"for {d.get('amount')}"
-                for d in duplicates
-            )
-            await query.edit_message_text(
-                f"Possible duplicate(s) found:\n{dup_info}\n\n"
-                "Is this a new, distinct transaction?",
-                reply_markup=yes_no_keyboard("dup"),
-            )
-            return
-        await _save_transaction(query, state, user_id)
+    if pending_id is not None:
+        await _dispatch_pending_callback(query, context, user_id, action, pending_id)
         return
 
-    if data == "txn_edit":
-        state["state"] = "awaiting_edit_field"
+    # No id suffix → stored-edit or reconciliation callbacks (single-track).
+    await _dispatch_global_callback(query, context, state, user_id, action)
+
+
+async def _dispatch_pending_callback(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    action: str,
+    pending_id: int,
+) -> None:
+    pending = db.load_pending_transaction(user_id, pending_id)
+    if not pending:
+        await query.edit_message_text("That transaction has expired.")
+        return
+
+    txn = pending.get("txn") or {}
+
+    if action == "txn_confirm":
+        await _confirm_pending(query, user_id, pending_id, pending)
+        return
+
+    if action == "txn_edit":
+        db.save_pending_transaction(user_id, pending_id, {
+            **pending, "state": "awaiting_edit_field",
+        })
         await query.edit_message_text(
             "Which field do you want to edit?",
-            reply_markup=edit_field_keyboard(),
+            reply_markup=edit_field_keyboard(tx_id=pending_id),
         )
         return
 
-    if data == "txn_cancel":
-        if txn and txn.get("tmp_s3_key"):
+    if action == "txn_cancel":
+        if txn.get("tmp_s3_key"):
             s3_store.delete_tmp_image(txn["tmp_s3_key"])
-        _mark_cleared(state)
+        db.delete_pending_transaction(user_id, pending_id)
         await query.edit_message_text("❌ Transaction cancelled.")
         return
 
-    if data.startswith("edit_"):
-        field = data.removeprefix("edit_")
-        if field == "back":
-            if not txn:
-                await query.edit_message_text("No pending transaction.")
-                _mark_cleared(state)
-                return
-            state["state"] = "awaiting_confirmation"
-            state.pop("edit_field", None)
-            await query.edit_message_text(
-                format_transaction_summary(txn),
-                reply_markup=confirmation_keyboard(),
-            )
-            return
-        if field == "category":
-            state["state"] = "awaiting_edit_category"
-            await query.edit_message_text(
-                "Choose a category:",
-                reply_markup=category_keyboard(
-                    prefix="editcat", back_data="editcat_back"
-                ),
-            )
-            return
-        if field == "currency":
-            state["state"] = "awaiting_edit_currency"
-            await query.edit_message_text(
-                "Choose a currency:",
-                reply_markup=currency_keyboard(prefix="editcur"),
-            )
-            return
-        state["state"] = "awaiting_edit_value"
-        state["edit_field"] = field
+    if action == "edit_back":
+        await query.edit_message_text(
+            format_transaction_summary(txn),
+            reply_markup=confirmation_keyboard(tx_id=pending_id),
+        )
+        db.save_pending_transaction(user_id, pending_id, {
+            **pending, "state": "awaiting_confirmation",
+        })
+        return
+
+    if action == "edit_category":
+        await query.edit_message_text(
+            "Choose a category:",
+            reply_markup=category_keyboard(
+                prefix="editcat",
+                back_data=f"editcat_back:{pending_id}",
+                tx_id=pending_id,
+            ),
+        )
+        db.save_pending_transaction(user_id, pending_id, {
+            **pending, "state": "awaiting_edit_category",
+        })
+        return
+
+    if action == "edit_currency":
+        await query.edit_message_text(
+            "Choose a currency:",
+            reply_markup=currency_keyboard(prefix="editcur", tx_id=pending_id),
+        )
+        db.save_pending_transaction(user_id, pending_id, {
+            **pending, "state": "awaiting_edit_currency",
+        })
+        return
+
+    if action.startswith("edit_"):
+        # Free-form value edit: merchant/description/amount/date/payment_method
+        field = action.removeprefix("edit_")
         prompt_text = (
-            "Enter the new date (YYYY-MM-DD, e.g. 2026-04-26):"
+            "Enter the new date (YYYY-MM-DD, e.g. 2026-04-26).\n"
+            "Reply to this message with the value, or tap Back."
             if field == "date"
-            else f"Enter the new value for {field}:"
+            else f"Enter the new value for {field}.\n"
+                 "Reply to this message with the value, or tap Back."
         )
         await query.edit_message_text(
             prompt_text,
-            reply_markup=back_button_keyboard("editvalue_back"),
+            reply_markup=back_button_keyboard(f"editvalue_back:{pending_id}"),
         )
-        state["edit_prompt_msg_id"] = query.message.message_id
+        prompt_msg_id = query.message.message_id
+        db.save_pending_transaction(user_id, pending_id, {
+            **pending,
+            "state": "awaiting_edit_value",
+            "edit_field": field,
+            "edit_prompt_msg_id": prompt_msg_id,
+        })
+        # Route the user's reply to *this* message back to the right pending.
+        db.save_reply_lookup(user_id, prompt_msg_id, {
+            "pending_id": pending_id, "kind": "edit", "field": field,
+        })
         return
 
-    if data == "editvalue_back":
-        state["state"] = "awaiting_edit_field"
-        state.pop("edit_field", None)
-        state.pop("edit_prompt_msg_id", None)
+    if action == "editvalue_back":
+        # Cancel the in-progress field edit, return to edit-field menu
+        prompt_msg_id = pending.get("edit_prompt_msg_id")
+        if prompt_msg_id:
+            db.delete_reply_lookup(user_id, prompt_msg_id)
+        new_pending = {**pending, "state": "awaiting_edit_field"}
+        new_pending.pop("edit_field", None)
+        new_pending.pop("edit_prompt_msg_id", None)
         await query.edit_message_text(
             "Which field do you want to edit?",
-            reply_markup=edit_field_keyboard(),
+            reply_markup=edit_field_keyboard(tx_id=pending_id),
         )
+        db.save_pending_transaction(user_id, pending_id, new_pending)
         return
 
-    if data.startswith("editcur_"):
-        suffix = data.removeprefix("editcur_")
-        if suffix == "back":
-            state["state"] = "awaiting_edit_field"
-            await query.edit_message_text(
-                "Which field do you want to edit?",
-                reply_markup=edit_field_keyboard(),
-            )
-            return
-        if txn is None:
-            await query.edit_message_text("No pending transaction.")
-            _mark_cleared(state)
-            return
+    if action == "editcur_back":
+        await query.edit_message_text(
+            "Which field do you want to edit?",
+            reply_markup=edit_field_keyboard(tx_id=pending_id),
+        )
+        db.save_pending_transaction(user_id, pending_id, {
+            **pending, "state": "awaiting_edit_field",
+        })
+        return
+
+    if action.startswith("editcur_"):
+        suffix = action.removeprefix("editcur_")
         if suffix not in ("PEN", "USD"):
             await query.edit_message_text("Unknown currency.")
             return
         txn["currency"] = suffix
-        state["state"] = "awaiting_confirmation"
         await query.edit_message_text(
             format_transaction_summary(txn),
-            reply_markup=confirmation_keyboard(),
+            reply_markup=confirmation_keyboard(tx_id=pending_id),
         )
+        db.save_pending_transaction(user_id, pending_id, {
+            **pending, "state": "awaiting_confirmation", "txn": txn,
+        })
         return
 
-    if data.startswith("editcat_"):
-        suffix = data.removeprefix("editcat_")
-        if suffix == "back":
-            state["state"] = "awaiting_edit_field"
-            await query.edit_message_text(
-                "Which field do you want to edit?",
-                reply_markup=edit_field_keyboard(),
-            )
-            return
-        if txn is None:
-            await query.edit_message_text("No pending transaction.")
-            _mark_cleared(state)
-            return
-        if suffix not in CATEGORY_NAME_BY_SLUG:
+    if action == "editcat_back":
+        await query.edit_message_text(
+            "Which field do you want to edit?",
+            reply_markup=edit_field_keyboard(tx_id=pending_id),
+        )
+        db.save_pending_transaction(user_id, pending_id, {
+            **pending, "state": "awaiting_edit_field",
+        })
+        return
+
+    if action.startswith("editcat_"):
+        slug = action.removeprefix("editcat_")
+        if slug not in CATEGORY_NAME_BY_SLUG:
             await query.edit_message_text("Unknown category.")
             return
-        txn["category_slug"] = suffix
-        txn["category_name"] = CATEGORY_NAME_BY_SLUG.get(suffix, suffix)
-        txn["needs_description"] = suffix == "other"
-
-        if txn["needs_description"] and not txn.get("description"):
-            state["state"] = "awaiting_missing_field"
-            state["missing_field"] = "description"
-            await query.edit_message_text(
-                'Category set to "Other". Please provide a brief description:'
-            )
-            return
-
-        if not txn.get("date"):
-            txn["date"] = date.today().isoformat()
-
-        state["state"] = "awaiting_confirmation"
+        txn["category_slug"] = slug
+        txn["category_name"] = CATEGORY_NAME_BY_SLUG.get(slug, slug)
         await query.edit_message_text(
             format_transaction_summary(txn),
-            reply_markup=confirmation_keyboard(),
+            reply_markup=confirmation_keyboard(tx_id=pending_id),
         )
+        db.save_pending_transaction(user_id, pending_id, {
+            **pending, "state": "awaiting_confirmation", "txn": txn,
+        })
         return
 
-    if data.startswith("cat_"):
-        slug = data.removeprefix("cat_")
-        if txn is None:
-            await query.edit_message_text("No pending transaction.")
+    if action.startswith("cat_"):
+        slug = action.removeprefix("cat_")
+        if slug not in CATEGORY_NAME_BY_SLUG:
+            await query.edit_message_text("Unknown category.")
             return
         txn["category_slug"] = slug
         txn["category_name"] = CATEGORY_NAME_BY_SLUG.get(slug, slug)
         txn["needs_description"] = slug == "other"
-
-        if txn["needs_description"] and not txn.get("description"):
-            state["state"] = "awaiting_missing_field"
-            state["missing_field"] = "description"
-            await query.edit_message_text(
-                'Category set to "Other". Please provide a brief description:'
-            )
-            return
-
-        if not txn.get("date"):
-            txn["date"] = date.today().isoformat()
-
-        state["state"] = "awaiting_confirmation"
-        await query.edit_message_text(
-            format_transaction_summary(txn),
-            reply_markup=confirmation_keyboard(),
+        txn["confident_category"] = True
+        await _present_step_after_callback(
+            query, context, user_id, pending_id, txn
         )
         return
 
-    if data == "dup_yes":
-        await _save_transaction(query, state, user_id)
+    if action == "dup_yes":
+        # User confirmed it's a distinct transaction; save.
+        await _save_pending(query, user_id, pending_id, pending)
         return
 
-    if data == "dup_no":
-        if txn and txn.get("tmp_s3_key"):
+    if action == "dup_no":
+        if txn.get("tmp_s3_key"):
             s3_store.delete_tmp_image(txn["tmp_s3_key"])
-        _mark_cleared(state)
+        db.delete_pending_transaction(user_id, pending_id)
         await query.edit_message_text("❌ Transaction cancelled (duplicate).")
         return
 
-    # --- Stored-tx edit flow (snapshot + multi-field iterate + save) -------
+    logger.warning("Unhandled pending callback action=%s pid=%s", action, pending_id)
+
+
+async def _confirm_pending(
+    query,
+    user_id: int,
+    pending_id: int,
+    pending: dict,
+) -> None:
+    txn = pending.get("txn") or {}
+    duplicates = db.check_duplicate_transaction(
+        amount=txn["amount"],
+        date_val=_coerce_txn_date(txn["date"]),
+        payment_method_id=txn["payment_method_id"],
+    )
+
+    pending_dups = _find_pending_duplicates(user_id, txn, exclude_pending_id=pending_id)
+
+    if duplicates or pending_dups:
+        lines = []
+        for d in duplicates:
+            lines.append(
+                f"  - {d.get('merchant', '?')} on {d.get('date')} "
+                f"for {d.get('amount')} (saved)"
+            )
+        for d in pending_dups:
+            lines.append(
+                f"  - {d.get('merchant', '?')} on {d.get('date')} "
+                f"for {d.get('amount')} (pending)"
+            )
+        await query.edit_message_text(
+            "Possible duplicate(s) found:\n" + "\n".join(lines) +
+            "\n\nIs this a new, distinct transaction?",
+            reply_markup=yes_no_keyboard("dup", tx_id=pending_id),
+        )
+        db.save_pending_transaction(user_id, pending_id, {
+            **pending, "state": "awaiting_duplicate_confirm",
+        })
+        return
+
+    await _save_pending(query, user_id, pending_id, pending)
+
+
+def _find_pending_duplicates(
+    user_id: int, txn: dict, exclude_pending_id: int,
+) -> list[dict]:
+    """Scan other PENDING items for amount/date/payment_method match."""
+    out: list[dict] = []
+    try:
+        amount_target = float(txn.get("amount"))
+        date_target = txn.get("date")
+        pm_target = txn.get("payment_method_id")
+    except (TypeError, ValueError):
+        return out
+    if date_target is None or pm_target is None:
+        return out
+    for blob in db.list_pending_transactions(user_id):
+        if blob.get("__pending_id__") == exclude_pending_id:
+            continue
+        other = blob.get("txn") or {}
+        try:
+            if (
+                float(other.get("amount")) == amount_target
+                and other.get("date") == date_target
+                and other.get("payment_method_id") == pm_target
+            ):
+                out.append(other)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+async def _save_pending(
+    query,
+    user_id: int,
+    pending_id: int,
+    pending: dict,
+) -> None:
+    txn = pending.get("txn") or {}
+    category_id = db.get_category_id_by_slug(txn["category_slug"])
+    if category_id is None:
+        await query.edit_message_text(
+            "Could not resolve category. Please choose a category and try again."
+        )
+        return
+
+    saved_row = db.save_transaction(
+        amount=txn["amount"],
+        currency=txn["currency"],
+        date_val=_coerce_txn_date(txn["date"]),
+        merchant=txn.get("merchant"),
+        description=txn.get("description"),
+        category_id=category_id,
+        payment_method_id=txn["payment_method_id"],
+        telegram_image_id=txn.get("telegram_image_id"),
+    )
+    txn_id = int(saved_row["id"])
+
+    tmp_s3_key = txn.get("tmp_s3_key")
+    if tmp_s3_key:
+        try:
+            final_key = s3_store.finalize_image(
+                tmp_s3_key,
+                txn_id=txn_id,
+                txn_date_iso=saved_row["date"],
+            )
+            db.update_transaction_image_path(txn_id, final_key)
+        except Exception:
+            logger.exception("Failed to finalize image for txn %s", txn_id)
+
+    # Clean up the pending item and any orphaned reply-lookup row.
+    prompt_msg_id = pending.get("edit_prompt_msg_id")
+    if prompt_msg_id:
+        db.delete_reply_lookup(user_id, prompt_msg_id)
+    db.delete_pending_transaction(user_id, pending_id)
+
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(f"✅ Transaction saved! (ID: {txn_id})")
+
+
+# ---------------------------------------------------------------------------
+# Global (single-track) callback dispatch: stored-edit + reconciliation
+# ---------------------------------------------------------------------------
+
+async def _dispatch_global_callback(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    state: dict,
+    user_id: int,
+    data: str,
+) -> None:
     if data == "storededit_confirm":
         await _apply_stored_edit(query, state)
         return
@@ -1021,7 +1189,6 @@ async def _handle_callback_inner(
             return
         snapshot["category_slug"] = suffix
         snapshot["category_name"] = CATEGORY_NAME_BY_SLUG.get(suffix, suffix)
-
         state["state"] = "awaiting_stored_edit_confirm"
         await query.edit_message_text(
             format_transaction_summary(snapshot),
@@ -1029,6 +1196,7 @@ async def _handle_callback_inner(
         )
         return
 
+    # Reconciliation callbacks (single-track)
     if data.startswith("recon_match_"):
         suffix = data.removeprefix("recon_match_")
         recon = state.get("recon")
@@ -1087,64 +1255,14 @@ async def _handle_callback_inner(
         await _advance_reconciliation(query, state, user_id)
         return
 
-
-# ---------------------------------------------------------------------------
-# Save confirmed transaction
-# ---------------------------------------------------------------------------
-
-async def _save_transaction(query, state: dict, user_id: int) -> None:
-    txn = state.get("pending_txn")
-    if not txn:
-        await query.edit_message_text("No pending transaction to save.")
-        _mark_cleared(state)
-        return
-
-    category_id = db.get_category_id_by_slug(txn["category_slug"])
-    if category_id is None:
-        await query.edit_message_text(
-            "Could not resolve category. Please choose a category and try again."
-        )
-        return
-
-    saved_row = db.save_transaction(
-        amount=txn["amount"],
-        currency=txn["currency"],
-        date_val=_coerce_txn_date(txn["date"]),
-        merchant=txn.get("merchant"),
-        description=txn.get("description"),
-        category_id=category_id,
-        payment_method_id=txn["payment_method_id"],
-        telegram_image_id=txn.get("telegram_image_id"),
-    )
-    txn_id = int(saved_row["id"])
-
-    tmp_s3_key = txn.get("tmp_s3_key")
-    if tmp_s3_key:
-        try:
-            final_key = s3_store.finalize_image(
-                tmp_s3_key,
-                txn_id=txn_id,
-                txn_date_iso=saved_row["date"],
-            )
-            db.update_transaction_image_path(txn_id, final_key)
-        except Exception:
-            logger.exception("Failed to finalize image for txn %s", txn_id)
-
-    _mark_cleared(state)
-    await query.edit_message_reply_markup(reply_markup=None)
-    await query.message.reply_text(f"✅ Transaction saved! (ID: {txn_id})")
+    logger.warning("Unhandled global callback data=%s", data)
 
 
 # ---------------------------------------------------------------------------
-# Apply confirmed edit
+# Apply confirmed edit on a saved tx
 # ---------------------------------------------------------------------------
 
 async def _apply_stored_edit(query, state: dict) -> None:
-    """Diff edit_snapshot vs edit_original and write only changed fields.
-
-    A single update_transaction_fields call covers both the simple-update
-    and the amount/date key-rewrite paths.
-    """
     snapshot = state.get("edit_snapshot")
     original = state.get("edit_original")
     txn_id = state.get("edit_txn_id")
@@ -1288,7 +1406,7 @@ async def _handle_document_inner(
 
 
 # ---------------------------------------------------------------------------
-# Reconciliation orchestration (batched LLM calls)
+# Reconciliation orchestration (unchanged)
 # ---------------------------------------------------------------------------
 
 async def run_reconciliation(
@@ -1298,7 +1416,6 @@ async def run_reconciliation(
     state: dict,
     user_id: int,
 ) -> None:
-    """Drive the auto-match loop and hand Telegram users the review queue."""
     result = reconciliation_agent.auto_reconcile(
         account_id=account_id,
         billing_period=billing_period,
@@ -1330,8 +1447,6 @@ async def run_reconciliation(
 
 
 async def _send_next_review_item(reply_target, state: dict, user_id: int) -> None:
-    """Present the next review or unmatched item. ``reply_target`` must support
-    ``reply_text`` (an Update.message or a CallbackQuery.message)."""
     recon = state.get("recon", {})
     review_queue = recon.get("review_queue", [])
     unmatched_queue = recon.get("unmatched_queue", [])
