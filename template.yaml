@@ -178,6 +178,52 @@ Resources:
       LogGroupName: !Sub /aws/lambda/${WidgetApiFunction}
       RetentionInDays: 7
 
+  InsightsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: pfa-insights
+      CodeUri: .
+      Handler: insights_handler.handler
+      MemorySize: 256
+      Timeout: 15
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FinanceAgentTable
+          ALLOWED_USER_ID: !Ref AllowedUserId
+          INSIGHTS_TIMEZONE: America/Lima
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref FinanceAgentTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !GetAtt FinanceAgentTable.Arn
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/pfa/telegram-bot-token
+            - Effect: Allow
+              Action: kms:Decrypt
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub ssm.${AWS::Region}.amazonaws.com
+      Events:
+        WeeklyDigest:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 12 ? * MON *)
+            Enabled: true
+            Description: Weekly spending digest (UTC); no Bedrock
+
+  InsightsFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${InsightsFunction}
+      RetentionInDays: 7
+
 Outputs:
   WebhookUrl:
     Description: Copy this into Telegram's setWebhook call

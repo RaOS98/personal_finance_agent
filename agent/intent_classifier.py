@@ -1,9 +1,8 @@
 """Intent classification via Amazon Bedrock (Claude Haiku 4.5).
 
-Routes free-form Telegram text to one of three intents:
+Routes free-form Telegram text to one of two intents:
 - new_transaction: log a new spend (existing flow)
 - edit: edit a previously logged transaction
-- query: answer a question about historical transactions
 """
 
 from __future__ import annotations
@@ -21,9 +20,9 @@ import config
 logger = logging.getLogger(__name__)
 
 
-SYSTEM_PROMPT = """You are an intent classifier for a personal finance Telegram bot. Messages are bilingual (English and Spanish). Classify each user message into EXACTLY ONE of three intents:
+SYSTEM_PROMPT = """You are an intent classifier for a personal finance Telegram bot. Messages are bilingual (English and Spanish). Classify each user message into EXACTLY ONE of two intents:
 
-1. new_transaction - The user is logging a new spend. Typically includes an amount plus a merchant or purpose, or is a short phrase describing a purchase.
+1. new_transaction - The user is logging a new spend. Typically includes an amount plus a merchant or purpose, or is a short phrase describing a purchase. Also use this for questions, chit-chat, or anything that is NOT clearly an edit of a prior logged transaction.
    Examples:
    - "starbucks 25 soles yape"
    - "lunch 40 amex"
@@ -32,6 +31,7 @@ SYSTEM_PROMPT = """You are an intent classifier for a personal finance Telegram 
    - "taxi al aeropuerto 50"
    - "gas sapphire 120"
    - "pago de luz 180 yape"
+   - "how much did I spend on food?" (no edit — treat as new_transaction)
 
 2. edit - The user wants to modify a previously logged transaction. Typically contains verbs like change, update, edit, fix, cambia, cambiar, actualiza, modificar, or refers to "the last one", "my last transaction", "la ultima", "el anterior".
    Examples:
@@ -41,23 +41,13 @@ SYSTEM_PROMPT = """You are an intent classifier for a personal finance Telegram 
    - "fix the category, it was groceries"
    - "actualiza la fecha a ayer"
 
-3. query - The user is asking a question about historical transactions, balances, totals, or trends. Typically starts with how much, what, cuanto, cuantos, which, cuales, when, cuando, show, list, muestra, or is a question ending with "?".
-   Examples:
-   - "how much did I spend on food this month?"
-   - "cuanto gaste en comida este mes"
-   - "what was my biggest expense last week?"
-   - "list my uber rides"
-   - "muestra los gastos de marzo"
-   - "cual fue mi ultimo gasto en starbucks"
-
 Rules:
 - When a message contains both an amount AND a merchant/purpose, default to new_transaction unless the message explicitly says edit/change/update or clearly refers to a prior transaction.
 - Short standalone amounts ("25 soles yape") are new_transaction.
-- Questions, especially starting with how/what/cuanto or ending in "?", are query.
-- Commands to change/update/fix are edit.
+- Commands to change/update/fix a logged entry are edit.
 - Set confident=false only if the intent is genuinely ambiguous.
 
-Respond with ONLY a JSON object with exactly these keys: intent, confident. The value of intent MUST be one of "new_transaction", "edit", or "query". No other text."""
+Respond with ONLY a JSON object with exactly these keys: intent, confident. The value of intent MUST be one of "new_transaction" or "edit". No other text."""
 
 
 NULL_RESULT: dict[str, Any] = {
@@ -85,7 +75,7 @@ def _parse_json(content: str) -> dict:
 
 
 def classify_intent(text: str) -> dict:
-    """Classify a Telegram text message into one of three intents.
+    """Classify a Telegram text message into one of two intents.
 
     Returns a dict with keys: intent, confident. On failure, returns the
     fail-open default (new_transaction, unconfident) plus an "error" key.
@@ -108,7 +98,7 @@ def classify_intent(text: str) -> dict:
             output_text = response["output"]["message"]["content"][0]["text"]
             parsed = _parse_json(output_text)
             intent = parsed.get("intent")
-            if intent not in {"new_transaction", "edit", "query"}:
+            if intent not in {"new_transaction", "edit"}:
                 if attempt == 0:
                     logger.warning("Classifier returned unexpected intent: %r", intent)
                     continue

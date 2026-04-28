@@ -8,21 +8,19 @@ This document describes the features of the Personal Finance Agent, organized by
 
 ## 0. Intent-Based Routing
 
-Free-form text messages are classified into one of three intents at the top of the message handler. The classifier (Claude Haiku 4.5) reads the message and returns one of:
+Free-form text messages are classified into one of two intents at the top of the message handler. The classifier (Claude Haiku 4.5) reads the message and returns one of:
 
-- `new_transaction` — log a new spend (default)
+- `new_transaction` — log a new spend (default), or any message that is not clearly an edit of a prior transaction
 - `edit` — modify a previously logged transaction
-- `query` — answer a question about historical transactions
 
 **Bypass conditions** (the classifier is skipped):
 - The message contains a photo — always treated as a new transaction.
 - The user is mid-flow (e.g., the bot is awaiting a missing field or category selection) — the existing state-machine handler runs instead.
 
-**Escape hatches** (override the classifier):
+**Escape hatch** (override the classifier):
 - Prefix the message with `!` to force the edit flow (e.g., `!change merchant to Pedro`).
-- Prefix the message with `?` to force the query flow (e.g., `?balance this month`).
 
-**Failure mode:** The classifier fails open. Any error or unrecognized response defaults to `new_transaction`. The reasoning: missing a new transaction silently loses user data; misclassifying an edit/query just prompts a rephrase.
+**Failure mode:** The classifier fails open. Any error or unrecognized response defaults to `new_transaction`. The reasoning: missing a new transaction silently loses user data; misclassifying an edit just prompts a rephrase.
 
 ---
 
@@ -183,52 +181,31 @@ These are deferred until real usage patterns are known.
 
 ---
 
-## 4. Natural-Language Queries
+## 4. Periodic spending insights (Telegram)
 
-Ask questions about historical spending in plain English or Spanish. The query agent runs a tool-use loop over DynamoDB and replies with cited transaction ids so the user can verify any number it cites.
+The stack can run a **scheduled Lambda** (EventBridge) that pushes a short, **deterministic** digest to the same Telegram chat as the bot. There is **no LLM** on this path: numbers come straight from DynamoDB aggregation (same logic as the widget summary plus a seven-day category rollup).
 
-### 4.1 Trigger
+### 4.1 What the user sees
 
-The intent classifier routes messages like "how much did I spend on food this month?" or "cuanto gaste en uber esta semana" to the query flow. Prefix any message with `?` to force it (e.g., `?balance`).
+A typical weekly message includes:
 
-### 4.2 Flow
+- **Week of** (Monday date in the configured timezone)
+- **Month-to-date** PEN (and USD if non-zero) totals, **today** PEN
+- **Top spending categories** (PEN) for the month and for the last seven days
+- **Unreconciled** transaction count (nudge to reconcile card spend)
+- **Transaction count** logged in the current month
 
-**User sends:**
-```
-how much did I spend on food this month?
-```
+If there are no transactions in the current month, the Lambda skips sending (nothing to report).
 
-**Bot replies:** `Thinking…` (covers the 2–4 second latency).
+### 4.2 Deduping
 
-**Agent does:**
-1. Calls `get_today` to resolve "this month" → date range.
-2. Calls `aggregate_by_category(date_from, date_to)` (or `query_transactions(...)` filtered by `category_slug=food_dining`) to fetch the figures.
-3. Returns a final JSON envelope `{answer, source_txn_ids}`.
+After a successful send, the function stores a week key on `STATE#<telegram_user_id>` / `INSIGHT_LAST` in DynamoDB so EventBridge retries do not duplicate the same digest.
 
-**Bot replies:**
-```
-You spent S/. 312.50 on food this month across 8 transactions.
+### 4.3 Configuration
 
-Based on: #42, #47, #51, #55, #60, #63, #68, #71
-```
-
-### 4.3 Tool Surface
-
-The query agent has access to four tools:
-
-| Tool | Purpose |
-|------|---------|
-| `get_today()` | Returns today's ISO date so the model can resolve relative time phrases. |
-| `list_recent_transactions(limit)` | Fetches the N most recent transactions (capped at 50). |
-| `query_transactions(date_from, date_to, category_slug?, payment_method_alias?)` | Date-range query with optional filters; capped at 50 rows. |
-| `aggregate_by_category(date_from, date_to)` | Groups by category and sums per currency. |
-
-### 4.4 Limitations
-
-- Hard cap of 4 tool-use iterations per query — bounds worst-case latency.
-- Tool results capped at 50 rows. If the full result exceeded the cap, the model sees `truncated: true` and is instructed to communicate the limitation in its answer.
-- Stateless: the agent sees only the current question, not the prior conversation. Follow-up questions need to restate context.
-- Currency assumed to be PEN unless the user explicitly says USD or dollars.
+- `ALLOWED_USER_ID` — chat id (same as the bot gate)
+- `INSIGHTS_TIMEZONE` — IANA zone for "today" (default `America/Lima`)
+- Schedule — see `template.yaml` (default: weekly Monday 12:00 UTC; adjust to taste)
 
 ---
 

@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document defines how the AI agent behaves: what prompts it receives, how it processes inputs, what outputs it produces, and the rules it follows. The agent is powered by Amazon Bedrock — Claude Sonnet 4.6 for vision extraction, Claude Haiku 4.5 for everything else (intent classification, categorization, edit parsing, query answering, reconciliation) — called via the Bedrock Converse API. The Telegram bot handles all user communication and passes structured requests to the agent.
+This document defines how the AI agent behaves: what prompts it receives, how it processes inputs, what outputs it produces, and the rules it follows. The agent is powered by Amazon Bedrock — Claude Sonnet 4.6 for vision extraction, Claude Haiku 4.5 for everything else (intent classification, categorization, edit parsing, reconciliation) — called via the Bedrock Converse API. The Telegram bot handles all user communication and passes structured requests to the agent.
 
 All LLM calls use the Converse API with `cachePoint` system prompt blocks for prompt caching. Retries on JSON parse failure are handled internally.
 
@@ -18,11 +18,11 @@ All LLM calls use the Converse API with `cachePoint` system prompt blocks for pr
 
 ## Agent Tasks
 
-The agent performs seven distinct tasks. Each task has its own system prompt, input format, and output format.
+The agent performs six distinct tasks. Each task has its own system prompt, input format, and output format.
 
 ### Task 0: Intent Classification
 
-**Purpose:** Route a free-form Telegram text message to one of three downstream flows.
+**Purpose:** Route a free-form Telegram text message to one of two downstream flows.
 
 **Model:** Claude Haiku 4.5 (`us.anthropic.claude-haiku-4-5-20251001-v1:0`)
 
@@ -33,26 +33,23 @@ The agent performs seven distinct tasks. Each task has its own system prompt, in
 **Bypass conditions** (handled before the classifier is called):
 - The message contains a photo (always treated as `new_transaction`).
 - The user is mid-flow (`state.state` is non-empty) — the existing state-machine handler runs instead.
-- The message starts with `!` (forces `edit`) or `?` (forces `query`); the prefix is stripped before downstream processing.
+- The message starts with `!` (forces `edit`); the prefix is stripped before downstream processing.
 
 **System prompt:**
 ```
 You are an intent classifier for a personal finance Telegram bot.
 Messages are bilingual (English and Spanish). Classify each user
-message into EXACTLY ONE of three intents:
+message into EXACTLY ONE of two intents:
 
-1. new_transaction — User is logging a new spend. Typically includes
-   an amount plus a merchant or purpose.
+1. new_transaction — User is logging a new spend, or the message is
+   not clearly an edit of a prior transaction (including questions).
 2. edit — User wants to modify a previously logged transaction.
    Verbs like change, update, edit, fix, cambia, cambiar, actualiza.
-3. query — User is asking a question about historical transactions.
-   Often starts with how much, what, cuanto, which, when, or ends
-   with "?".
 
 Rules:
 - When a message contains both an amount AND a merchant/purpose,
   default to new_transaction unless the message explicitly says
-  edit/change/update.
+  edit/change/update or clearly refers to a prior transaction.
 - Set confident=false only if genuinely ambiguous.
 
 Respond with ONLY a JSON object: {intent, confident}.
@@ -63,7 +60,7 @@ Respond with ONLY a JSON object: {intent, confident}.
 {"intent": "new_transaction", "confident": true}
 ```
 
-**Error handling:** Fails open. On JSON parse failure, unrecognized intent, or any Bedrock error, the function returns `{"intent": "new_transaction", "confident": false, "error": "..."}`. The bot then falls through to the new-transaction flow. Rationale: missing a new transaction silently loses user data; misclassifying an edit/query only prompts a rephrase.
+**Error handling:** Fails open. On JSON parse failure, unrecognized intent, or any Bedrock error, the function returns `{"intent": "new_transaction", "confident": false, "error": "..."}`. The bot then falls through to the new-transaction flow. Rationale: missing a new transaction silently loses user data; misclassifying an edit only prompts a rephrase.
 
 ---
 
@@ -335,58 +332,6 @@ Unknown verdict values from the model are coerced to `uncertain`. The dashboard 
 **v1 scope:** edits the most recent transaction only. Reference resolution ("my last Starbucks", "the 25 soles one from Tuesday") is out of scope.
 
 **Confirmation gate:** Every edit goes through a mandatory `awaiting_edit_target_confirm` state with a yes/no keyboard before any DynamoDB write. The bot displays the old → new diff and the txn id so the user can abort.
-
----
-
-### Task 6: Query Answering (Tool-Use)
-
-**Purpose:** Answer free-form questions about historical transactions by reading from DynamoDB.
-
-**Model:** Claude Haiku 4.5 (`us.anthropic.claude-haiku-4-5-20251001-v1:0`)
-
-**File:** `agent/query_agent.py`
-
-**Function signature:** `answer_query(text: str) -> dict`
-
-**Tool surface (4 primitives):**
-
-| Tool | Input | Behavior |
-|------|-------|----------|
-| `get_today` | none | Returns today's ISO date so the model can resolve "this month", "last week", etc. |
-| `list_recent_transactions` | `limit: int` (capped at 50) | Returns the N most recent transactions, newest first. |
-| `query_transactions` | `date_from`, `date_to`, optional `category_slug`, optional `payment_method_alias` | Returns up to 50 transactions in the date range, post-filtered. Includes `truncated: true` if the full result exceeded the cap. |
-| `aggregate_by_category` | `date_from`, `date_to` | Groups transactions in the range by `category_slug` and sums `amount` per currency. |
-
-**Loop control:**
-- Hard cap of 4 tool-use iterations per query. Empirically sufficient: one to plan + call, one for the result, one for an optional second tool, one for the final answer.
-- Each tool result is truncated to 50 rows to prevent context blow-up on wide date ranges; the model sees `truncated: true` and is instructed to communicate the limitation.
-
-**System prompt (excerpt):**
-```
-You are a personal-finance analyst answering questions about the
-user's logged transactions. Use the tools to fetch data — do not
-invent numbers.
-
-Guidance:
-- Call get_today first when the user's question involves a relative
-  time ("this month", "today", "last week").
-- Dates must be ISO YYYY-MM-DD.
-- Assume currency PEN unless the user explicitly says USD.
-- Keep your final answer concise (1–3 sentences).
-- List the transaction ids your answer is based on in source_txn_ids.
-
-Your final response (after all tool calls) MUST be ONLY a JSON
-object: {answer, source_txn_ids}.
-```
-
-**Expected output:**
-```json
-{"answer": "You spent S/. 312.50 on food this month across 8 transactions.", "source_txn_ids": [42, 47, 51, 55, 60, 63, 68, 71]}
-```
-
-**Why a citation envelope:** Forcing the model to enumerate the transaction ids that back its answer makes hallucinations cheaper to detect and gives the user a self-serve verification path. The bot renders the ids as a "Based on: #42, #47, …" trailer below the answer.
-
-**Error handling:** On any Bedrock error, JSON parse failure, or loop overrun, the function returns `{"answer": null, "source_txn_ids": [], "error": "..."}`. The bot replies "I couldn't answer that. Try rephrasing or use `?` prefix."
 
 ---
 

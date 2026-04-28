@@ -31,13 +31,14 @@ class ClassifyIntentTests(unittest.TestCase):
         self.assertEqual(result["intent"], "new_transaction")
         self.assertTrue(result["confident"])
 
-    def test_query(self) -> None:
+    def test_question_text_maps_to_new_transaction(self) -> None:
+        """NL questions are no longer a separate intent; classifier may send new_transaction."""
         with patch.object(intent_classifier, "_bedrock") as mock_bedrock:
-            mock_bedrock.converse.return_value = _mock_response("query")
+            mock_bedrock.converse.return_value = _mock_response("new_transaction")
             result = intent_classifier.classify_intent(
                 "cuanto gaste en comida este mes"
             )
-        self.assertEqual(result["intent"], "query")
+        self.assertEqual(result["intent"], "new_transaction")
         self.assertTrue(result["confident"])
 
     def test_edit(self) -> None:

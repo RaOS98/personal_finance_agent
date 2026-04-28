@@ -45,6 +45,9 @@ USER_STATE_TTL_SECONDS = int(os.environ.get("USER_STATE_TTL_SECONDS", "3600"))
 # Access control
 ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))
 
+# Periodic insights Lambda (IANA zone for wall-clock "today")
+INSIGHTS_TIMEZONE = os.environ.get("INSIGHTS_TIMEZONE", "America/Lima")
+
 # Widget API (forward-compat: also serves the future web dashboard)
 WIDGET_ALLOWED_ORIGINS = os.environ.get("WIDGET_ALLOWED_ORIGINS", "*")
 

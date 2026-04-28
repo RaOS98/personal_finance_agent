@@ -14,6 +14,7 @@ Single-table design (table name from ``config.DYNAMODB_TABLE``):
     STATE#{user_id}             current                           bot user state (global flows)
     STATE#{user_id}             PENDING#{msg_id}                  one in-flight new-tx flow
     STATE#{user_id}             REPLY#{prompt_msg_id}             ForceReply prompt → pending lookup
+    STATE#{user_id}             INSIGHT_LAST                      last periodic digest key (TTL)
 
 Global secondary indexes:
 
@@ -494,6 +495,30 @@ def list_transactions_in_month(year: int, month: int) -> list[dict[str, Any]]:
     return [_normalize_item(i) for i in resp.get("Items", [])]
 
 
+def list_transactions_between(date_from: date, date_to: date) -> list[dict[str, Any]]:
+    """Return transactions whose ``date`` (from item body) falls in the inclusive range.
+
+    Uses ``PK = TXN`` and ``SK`` between ``{date_from}#`` and ``{date_to}#zzzzzzzz``.
+    Caller must ensure ``date_from <= date_to``.
+    """
+    if date_from > date_to:
+        date_from, date_to = date_to, date_from
+    sk_lo = f"{_iso(date_from)}#"
+    sk_hi = f"{_iso(date_to)}#zzzzzzzz"
+    resp = _table.query(
+        KeyConditionExpression=Key("PK").eq("TXN") & Key("SK").between(sk_lo, sk_hi),
+    )
+    items = [_normalize_item(i) for i in resp.get("Items", [])]
+    lo_iso = _iso(date_from)
+    hi_iso = _iso(date_to)
+    out: list[dict[str, Any]] = []
+    for item in items:
+        d = item.get("date") or ""
+        if isinstance(d, str) and lo_iso <= d <= hi_iso:
+            out.append(item)
+    return out
+
+
 def _get_transaction(transaction_id: int) -> dict[str, Any] | None:
     """Find a transaction by integer id. Returns the raw item with ``_sk``
     populated so callers can do targeted updates. Returns None if missing."""
@@ -888,6 +913,36 @@ def delete_reply_lookup(user_id: int, prompt_msg_id: int) -> None:
         Key={
             "PK": f"STATE#{int(user_id)}",
             "SK": f"REPLY#{int(prompt_msg_id)}",
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Periodic insight digest idempotency (long TTL, not tied to bot flows)
+# ---------------------------------------------------------------------------
+
+_INSIGHT_TTL_SECONDS = 86400 * 400  # ~13 months — old keys age out naturally
+
+
+def load_last_insight_digest_key(user_id: int) -> str | None:
+    resp = _table.get_item(
+        Key={"PK": f"STATE#{int(user_id)}", "SK": "INSIGHT_LAST"}
+    )
+    item = resp.get("Item")
+    if not item:
+        return None
+    key = item.get("digest_key")
+    return str(key) if key else None
+
+
+def save_last_insight_digest_key(user_id: int, digest_key: str) -> None:
+    ttl = int(time.time()) + _INSIGHT_TTL_SECONDS
+    _table.put_item(
+        Item={
+            "PK": f"STATE#{int(user_id)}",
+            "SK": "INSIGHT_LAST",
+            "digest_key": digest_key,
+            "ttl": ttl,
         }
     )
 
