@@ -105,6 +105,82 @@ inline edit), Category Breakdown, Trends, Upload Statement (PDF parse +
 preview + auto-reconcile), Manual Reconciliation (per-line candidate review,
 unmatch, add-as-new), and Reconciliation Status.
 
+## Widget API (iPhone widget + future web dashboard)
+
+A second Lambda (`pfa-widget-api`) sits behind the same API Gateway and
+serves a single read-only endpoint, `GET /widget/summary`, that returns a
+versioned JSON envelope of the current month's spending. It backs the
+Scriptable iOS widget today and is designed to back a static web dashboard
+later without breaking changes.
+
+### One-time setup
+
+1. Provision the bearer token. Generate a random value and store it in SSM
+   as a `SecureString`:
+
+   ```bash
+   aws ssm put-parameter \
+     --name /pfa/widget-bearer-token \
+     --type SecureString \
+     --value "$(openssl rand -hex 32)" \
+     --description "Bearer token for the personal-finance widget API"
+   ```
+
+2. Deploy. The same `sam deploy` command that ships the bot also creates
+   the widget function, its log group, and the new `/widget/summary` route:
+
+   ```bash
+   sam build && sam deploy
+   ```
+
+   Copy the `WidgetApiUrl` value from the stack outputs.
+
+3. Install the Scriptable widget on iPhone.
+
+   - Install [Scriptable](https://scriptable.app/) from the App Store.
+   - Paste [widgets/setup_keychain.js](widgets/setup_keychain.js) and
+     [widgets/scriptable.js](widgets/scriptable.js) as two separate scripts.
+   - Run `setup_keychain.js` once. It prompts for the API URL and the bearer
+     token (the SSM value from step 1) and stores both in the iOS Keychain.
+   - On the home screen, add a medium Scriptable widget and select
+     `scriptable.js`.
+
+### Rotating the bearer token
+
+```bash
+aws ssm put-parameter \
+  --name /pfa/widget-bearer-token \
+  --type SecureString \
+  --overwrite \
+  --value "$(openssl rand -hex 32)"
+
+# Force the Lambda containers to pick up the new value (the lru_cache
+# inside config._get_secret only refreshes on a cold start).
+sam deploy
+```
+
+Re-run `setup_keychain.js` on the iPhone with the new token.
+
+### JSON contract (`v1`)
+
+```json
+{
+  "version": 1,
+  "as_of": "2026-04-28T16:32:11Z",
+  "period": {"year": 2026, "month": 4},
+  "totals": {"month_pen": 1240.50, "month_usd": 45.00, "today_pen": 80.00, "today_usd": 0.00},
+  "by_category_pen": {"groceries": 380.0, "food_dining": 220.0},
+  "by_category_usd": {},
+  "unreconciled_count": 3,
+  "txn_count": 47
+}
+```
+
+The category dicts are slug-keyed so the widget and a future SPA can render
+their own display names. The Scriptable script keeps a small slug → display
+map in sync with the [transaction categories](#transaction-categories) list
+above; remember to update both in tandem if a category is added.
+
 ## Project Documentation
 
 | Document | Description |

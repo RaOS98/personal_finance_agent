@@ -476,6 +476,22 @@ def list_recent_transactions(limit: int) -> list[dict[str, Any]]:
     return [_normalize_item(i) for i in resp.get("Items", [])]
 
 
+def list_transactions_in_month(year: int, month: int) -> list[dict[str, Any]]:
+    """Return all transactions whose ``date`` falls in the given month.
+
+    Single ``Query`` against ``PK = "TXN"`` with an ``SK begins_with`` filter
+    on the ``YYYY-MM`` prefix. Stays well under the 1 MB page limit at the
+    expected data volume (hundreds of items per month max), so we don't bother
+    paginating here -- if that assumption ever changes a paginating wrapper
+    can be added without touching callers.
+    """
+    prefix = f"{int(year):04d}-{int(month):02d}"
+    resp = _table.query(
+        KeyConditionExpression=Key("PK").eq("TXN") & Key("SK").begins_with(prefix),
+    )
+    return [_normalize_item(i) for i in resp.get("Items", [])]
+
+
 def _get_transaction(transaction_id: int) -> dict[str, Any] | None:
     """Find a transaction by integer id. Returns the raw item with ``_sk``
     populated so callers can do targeted updates. Returns None if missing."""

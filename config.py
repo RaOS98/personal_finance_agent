@@ -45,6 +45,9 @@ USER_STATE_TTL_SECONDS = int(os.environ.get("USER_STATE_TTL_SECONDS", "3600"))
 # Access control
 ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))
 
+# Widget API (forward-compat: also serves the future web dashboard)
+WIDGET_ALLOWED_ORIGINS = os.environ.get("WIDGET_ALLOWED_ORIGINS", "*")
+
 
 # ---------------------------------------------------------------------------
 # Secrets: env-var first (local dev), SSM fallback (Lambda runtime)
@@ -53,12 +56,21 @@ ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))
 _SECRET_SSM_PARAMS: dict[str, str] = {
     "TELEGRAM_BOT_TOKEN": "/pfa/telegram-bot-token",
     "TELEGRAM_WEBHOOK_SECRET": "/pfa/telegram-webhook-secret",
+    "WIDGET_BEARER_TOKEN": "/pfa/widget-bearer-token",
 }
 
 
 @lru_cache(maxsize=None)
 def _get_secret(env_var: str) -> str:
-    """Return a secret from env var, or fetch from SSM if env var is unset."""
+    """Return a secret from env var, or fetch from SSM if env var is unset.
+
+    Fails soft and returns an empty string when both sources come up empty
+    (env var unset + SSM denied / not found). The bot and widget Lambdas
+    share this module but have disjoint IAM scopes -- the bot can read the
+    Telegram parameters but not the widget token, and the widget Lambda is
+    the inverse. Each caller is expected to verify a non-empty value before
+    relying on it.
+    """
     direct = os.environ.get(env_var)
     if direct:
         return direct
@@ -67,12 +79,28 @@ def _get_secret(env_var: str) -> str:
         return ""
     # Lazy import so tests / dashboard that only use non-secret config
     # don't pay the boto3 import cost.
-    import boto3
+    try:
+        import boto3
 
-    ssm = boto3.client("ssm", region_name=AWS_REGION)
-    resp = ssm.get_parameter(Name=param_name, WithDecryption=True)
-    return resp["Parameter"]["Value"]
+        ssm = boto3.client("ssm", region_name=AWS_REGION)
+        resp = ssm.get_parameter(Name=param_name, WithDecryption=True)
+        return resp["Parameter"]["Value"]
+    except Exception as exc:
+        # Any failure here is non-fatal at import time: cross-function IAM
+        # scoping (AccessDenied), missing parameter, no credentials in unit
+        # tests, network issues, etc. The caller is expected to verify a
+        # non-empty value before relying on it.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Could not load secret %s from SSM (%s): %s",
+            env_var,
+            param_name,
+            exc.__class__.__name__,
+        )
+        return ""
 
 
 TELEGRAM_BOT_TOKEN = _get_secret("TELEGRAM_BOT_TOKEN")
 TELEGRAM_WEBHOOK_SECRET = _get_secret("TELEGRAM_WEBHOOK_SECRET")
+WIDGET_BEARER_TOKEN = _get_secret("WIDGET_BEARER_TOKEN")
