@@ -138,10 +138,53 @@ Resources:
       LogGroupName: !Sub /aws/lambda/${BotFunction}
       RetentionInDays: 7
 
+  WidgetApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: pfa-widget-api
+      CodeUri: .
+      Handler: api.widget_handler.handler
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FinanceAgentTable
+          WIDGET_ALLOWED_ORIGINS: "*"
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref FinanceAgentTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/pfa/widget-bearer-token
+            - Effect: Allow
+              Action: kms:Decrypt
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub ssm.${AWS::Region}.amazonaws.com
+      Events:
+        WidgetSummary:
+          Type: HttpApi
+          Properties:
+            Path: /widget/summary
+            Method: ANY
+
+  WidgetApiFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${WidgetApiFunction}
+      RetentionInDays: 7
+
 Outputs:
   WebhookUrl:
     Description: Copy this into Telegram's setWebhook call
     Value: !Sub https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/telegram/webhook
+  WidgetApiUrl:
+    Description: HTTPS endpoint for the iPhone widget (and future web dashboard)
+    Value: !Sub https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/widget/summary
   TableName:
     Value: !Ref FinanceAgentTable
   BucketName:
