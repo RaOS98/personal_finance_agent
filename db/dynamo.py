@@ -11,7 +11,9 @@ Single-table design (table name from ``config.DYNAMODB_TABLE``):
     TXN                         {date}#{txn_id:08d}               transaction
     STMT#{acct}#{period}        {date}#{line_id:012x}             statement line
     MATCH                       STMT#{line_id:012x}#TXN#{txn_id}  reconciliation match
-    STATE#{user_id}             current                           bot user state
+    STATE#{user_id}             current                           bot user state (global flows)
+    STATE#{user_id}             PENDING#{msg_id}                  one in-flight new-tx flow
+    STATE#{user_id}             REPLY#{prompt_msg_id}             ForceReply prompt → pending lookup
 
 Global secondary indexes:
 
@@ -771,6 +773,123 @@ def save_user_state(user_id: int, state: dict[str, Any]) -> None:
 
 def clear_user_state(user_id: int) -> None:
     _table.delete_item(Key={"PK": f"STATE#{int(user_id)}", "SK": "current"})
+
+
+# ---------------------------------------------------------------------------
+# Per-pending-tx state items (parallel new-tx flows)
+# ---------------------------------------------------------------------------
+
+def load_pending_transaction(user_id: int, pending_id: int) -> dict[str, Any]:
+    resp = _table.get_item(
+        Key={"PK": f"STATE#{int(user_id)}", "SK": f"PENDING#{int(pending_id)}"}
+    )
+    item = resp.get("Item")
+    if not item:
+        return {}
+    data = item.get("data")
+    if not data:
+        return {}
+    try:
+        return json.loads(data)
+    except (TypeError, ValueError):
+        logger.exception(
+            "Failed to decode pending tx %s/%s", user_id, pending_id
+        )
+        return {}
+
+
+def save_pending_transaction(
+    user_id: int, pending_id: int, state: dict[str, Any]
+) -> None:
+    ttl = int(time.time()) + config.USER_STATE_TTL_SECONDS
+    _table.put_item(
+        Item={
+            "PK": f"STATE#{int(user_id)}",
+            "SK": f"PENDING#{int(pending_id)}",
+            "data": json.dumps(state, default=_json_default),
+            "ttl": ttl,
+        }
+    )
+
+
+def delete_pending_transaction(user_id: int, pending_id: int) -> None:
+    _table.delete_item(
+        Key={"PK": f"STATE#{int(user_id)}", "SK": f"PENDING#{int(pending_id)}"}
+    )
+
+
+def list_pending_transactions(user_id: int) -> list[dict[str, Any]]:
+    """Return every PENDING#... blob for ``user_id``. Each result has its
+    pending_id annotated under ``__pending_id__`` so the caller can match
+    back to the SK without parsing it twice."""
+    resp = _table.query(
+        KeyConditionExpression=Key("PK").eq(f"STATE#{int(user_id)}")
+        & Key("SK").begins_with("PENDING#"),
+    )
+    out: list[dict[str, Any]] = []
+    for item in resp.get("Items", []):
+        data = item.get("data")
+        if not data:
+            continue
+        try:
+            parsed = json.loads(data)
+        except (TypeError, ValueError):
+            logger.exception("Failed to decode pending tx item")
+            continue
+        sk = item.get("SK", "")
+        if sk.startswith("PENDING#"):
+            try:
+                parsed["__pending_id__"] = int(sk.removeprefix("PENDING#"))
+            except ValueError:
+                pass
+        out.append(parsed)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# ForceReply lookup: prompt msg_id → which pending tx + which field
+# ---------------------------------------------------------------------------
+
+def save_reply_lookup(
+    user_id: int, prompt_msg_id: int, payload: dict[str, Any]
+) -> None:
+    ttl = int(time.time()) + config.USER_STATE_TTL_SECONDS
+    _table.put_item(
+        Item={
+            "PK": f"STATE#{int(user_id)}",
+            "SK": f"REPLY#{int(prompt_msg_id)}",
+            "data": json.dumps(payload, default=_json_default),
+            "ttl": ttl,
+        }
+    )
+
+
+def load_reply_lookup(user_id: int, prompt_msg_id: int) -> dict[str, Any]:
+    resp = _table.get_item(
+        Key={
+            "PK": f"STATE#{int(user_id)}",
+            "SK": f"REPLY#{int(prompt_msg_id)}",
+        }
+    )
+    item = resp.get("Item")
+    if not item:
+        return {}
+    data = item.get("data")
+    if not data:
+        return {}
+    try:
+        return json.loads(data)
+    except (TypeError, ValueError):
+        return {}
+
+
+def delete_reply_lookup(user_id: int, prompt_msg_id: int) -> None:
+    _table.delete_item(
+        Key={
+            "PK": f"STATE#{int(user_id)}",
+            "SK": f"REPLY#{int(prompt_msg_id)}",
+        }
+    )
 
 
 def _json_default(obj: Any) -> Any:
