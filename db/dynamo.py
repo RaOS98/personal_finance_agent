@@ -339,6 +339,7 @@ _EDITABLE_TXN_FIELDS = {
     "merchant",
     "description",
     "amount",
+    "currency",
     "category_id",
     "category_slug",
     "category_name",
