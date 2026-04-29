@@ -27,7 +27,6 @@ from agent import (
     reconciliation as reconciliation_agent,
     statement_parser,
     intent_classifier,
-    query_agent,
 )
 from db import dynamo as db
 from bot.keyboards import (
@@ -279,9 +278,6 @@ async def _handle_message_inner(
         if stripped.startswith("!"):
             forced_intent = "edit"
             text = stripped[1:].strip()
-        elif stripped.startswith("?"):
-            forced_intent = "query"
-            text = stripped[1:].strip()
 
         if forced_intent:
             intent = forced_intent
@@ -291,9 +287,6 @@ async def _handle_message_inner(
 
         if intent == "edit":
             await _handle_edit_intent(update, context, state, user_id, text)
-            return
-        if intent == "query":
-            await _handle_query_intent(update, context, state, user_id, text)
             return
         # new_transaction → fall through
 
@@ -657,7 +650,7 @@ async def _handle_stored_edit_value(
 
 
 # ---------------------------------------------------------------------------
-# Edit / query intents (operate on saved transactions)
+# Edit / stored transactions (operate on saved transactions)
 # ---------------------------------------------------------------------------
 
 async def _handle_edit_intent(
@@ -684,38 +677,6 @@ async def _handle_edit_intent(
         format_transaction_summary(target),
         reply_markup=confirmation_keyboard(prefix="storededit"),
     )
-
-
-async def _handle_query_intent(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    state: dict,
-    user_id: int,
-    text: str,
-) -> None:
-    await update.message.reply_text("Thinking…")
-
-    try:
-        result = query_agent.answer_query(text)
-    except Exception:
-        logger.exception("query_agent failed")
-        await update.message.reply_text(
-            "I couldn't answer that. Try rephrasing or use `?` prefix."
-        )
-        return
-
-    answer = result.get("answer")
-    if not answer or result.get("error"):
-        await update.message.reply_text(
-            "I couldn't answer that. Try rephrasing or use `?` prefix."
-        )
-        return
-
-    source_ids = result.get("source_txn_ids") or []
-    reply = str(answer)
-    if source_ids:
-        reply += "\n\nBased on: " + ", ".join(f"#{i}" for i in source_ids)
-    await update.message.reply_text(reply)
 
 
 # ---------------------------------------------------------------------------

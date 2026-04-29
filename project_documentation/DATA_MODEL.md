@@ -16,6 +16,7 @@ All data is stored in a single DynamoDB table (`finance-agent`) using a single-t
 | Statement line | `STMT#{account_id}#{billing_period}` | `{date_iso}#{line_id}` |
 | Reconciliation match | `MATCH` | `STMT#{line_id}#TXN#{txn_id:08d}` |
 | User bot state | `STATE#{user_id}` | `current` |
+| Insight dedupe | `STATE#{user_id}` | `INSIGHT_LAST` |
 
 ---
 
@@ -230,11 +231,12 @@ Stores per-user conversation state for the Telegram bot. Auto-expires after inac
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | PK | S | `STATE#{user_id}` |
-| SK | S | `current` |
-| state | S | JSON-serialized state dict |
+| SK | S | `current` — JSON blob under attribute `data` (see `db.save_user_state`) |
 | ttl | N | Unix timestamp; DynamoDB TTL deletes item after expiry |
 
-TTL is set to `now + USER_STATE_TTL_SECONDS` (default: 3600) on every write. Expired items are deleted by DynamoDB automatically — no cleanup needed.
+**`INSIGHT_LAST`** — same `PK`; `SK = INSIGHT_LAST`. Attributes: `digest_key` (e.g. `2026-W17`), `ttl` (~13 months). Written by the periodic insights Lambda after a successful Telegram send to dedupe weekly runs.
+
+For `SK = current`, TTL is set to `now + USER_STATE_TTL_SECONDS` (default: 3600) on every write. Expired items are deleted by DynamoDB automatically — no cleanup needed.
 
 ---
 

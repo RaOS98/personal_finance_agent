@@ -53,7 +53,6 @@ All LLM calls go through the Bedrock Converse API. System prompts use `cachePoin
 | Transaction extraction (vision) | Claude Sonnet 4.6 (`us.anthropic.claude-sonnet-4-6-20250929-v1:0`) | `agent/extractor.py` |
 | Transaction categorization | Claude Haiku 4.5 | `agent/categorizer.py` |
 | Edit-request parsing | Claude Haiku 4.5 | `agent/tx_editor.py` |
-| Query answering (tool-use over DynamoDB) | Claude Haiku 4.5 | `agent/query_agent.py` |
 | Reconciliation matching (batched) | Claude Haiku 4.5 | `agent/reconciler.py` |
 | Statement parsing | Python only (`pdfplumber`) | `agent/statement_parser.py` |
 
@@ -61,7 +60,7 @@ All LLM calls go through the Bedrock Converse API. System prompts use `cachePoin
 
 **Auto-match loop is shared.** `agent/reconciliation.py` wraps the loop body — pull pending lines, find candidates, call `evaluate_matches`, persist confident singletons (with a date-diff tiebreaker for ties) — and exposes it to both the bot (`bot/handlers.run_reconciliation`) and the Streamlit dashboard (`page_upload_statement`). It accepts an optional `progress_callback` so the dashboard can drive `st.progress` while the bot ignores it.
 
-**Query is tool-using:** `query_agent.answer_query(text)` runs a bounded (≤4 iteration) tool-use loop with four DynamoDB primitives (`list_recent_transactions`, `query_transactions`, `aggregate_by_category`, `get_today`). The final response is a JSON envelope `{answer, source_txn_ids}` so the bot can render a citation trailer without a second LLM call.
+**Periodic insights (no LLM):** EventBridge invokes `insights_handler.py`, which reads DynamoDB via `api/aggregator.build_summary` and `api/insights` helpers, formats a short Telegram message, and sends it to `ALLOWED_USER_ID`. Dedupe uses `STATE#<user>/INSIGHT_LAST` in DynamoDB.
 
 ### 3. DynamoDB (Single-Table Design)
 
@@ -139,11 +138,10 @@ personal-finance-agent/
 │   ├── handlers.py          # Telegram message handlers
 │   └── keyboards.py         # Inline keyboards for confirmations
 ├── agent/
-│   ├── intent_classifier.py # Free-form text → new_transaction | edit | query (Bedrock)
+│   ├── intent_classifier.py # Free-form text → new_transaction | edit (Bedrock)
 │   ├── extractor.py         # Image/text → raw transaction fields (Bedrock)
 │   ├── categorizer.py       # Raw fields → categorized transaction (Bedrock)
 │   ├── tx_editor.py         # Natural-language edit request → field + new value (Bedrock)
-│   ├── query_agent.py       # Tool-use loop over DynamoDB to answer questions (Bedrock)
 │   ├── reconciler.py        # Batched match evaluation (Bedrock)
 │   ├── reconciliation.py    # Shared auto-match loop used by bot + dashboard
 │   └── statement_parser.py  # PDF → structured statement lines (pdfplumber)
@@ -152,8 +150,12 @@ personal-finance-agent/
 │   └── seed_dynamo.py       # One-shot reference data seeder
 ├── tests/
 │   ├── test_intent_classifier.py  # Mocked-Bedrock unit tests for the router
-│   ├── test_query_agent.py        # Mocked-Bedrock tests for the tool-use loop
+│   ├── test_insights.py             # Digest formatting (no Bedrock)
 │   └── test_tx_editor.py          # Mocked-Bedrock tests for the edit parser
+├── api/
+│   ├── aggregator.py        # Month summary JSON for widget API
+│   ├── insights.py          # Deterministic periodic digest text
+│   └── widget_handler.py    # Lambda handler for GET /widget/summary
 ├── dashboard/
 │   ├── app.py               # Streamlit application (auth gate + 7 pages)
 │   ├── dynamo_reader.py     # Cached read layer for the dashboard
@@ -167,7 +169,8 @@ personal-finance-agent/
 │   ├── AGENT_SPEC.md        # AI agent contracts and prompts
 │   └── DATA_MODEL.md        # DynamoDB schema reference
 ├── config.py                # Environment variable bindings
-├── lambda_handler.py        # Lambda entrypoint
+├── lambda_handler.py        # Lambda entrypoint (Telegram webhook)
+├── insights_handler.py    # Scheduled Lambda: periodic digest → Telegram
 ├── s3_store.py              # S3 helpers (receipt images + statement PDFs)
 ├── requirements.txt         # Lambda runtime dependencies
 └── template.yaml            # AWS SAM stack definition
@@ -189,7 +192,7 @@ User sends text message
         ├── photo present?           → existing new-transaction flow
         │
         ▼
-  Strip "!" or "?" prefix → forced intent (edit / query)
+  Strip "!" prefix → forced intent (edit)
         │
         ├── if no prefix → agent/intent_classifier.py (Claude Haiku 4.5)
         │                  returns {"intent": "...", "confident": ...}
@@ -198,11 +201,10 @@ User sends text message
   Dispatch on intent:
         │
         ├── new_transaction → existing extractor + categorizer flow
-        ├── edit            → _handle_edit_intent
-        └── query           → _handle_query_intent
+        └── edit            → _handle_edit_intent
 ```
 
-The classifier fails open: any error or unparseable response defaults to `new_transaction`. Missing a new transaction silently loses data; misclassifying a query/edit just prompts the user to rephrase.
+The classifier fails open: any error or unparseable response defaults to `new_transaction`. Missing a new transaction silently loses data; misclassifying an edit just prompts the user to rephrase.
 
 ### Transaction Capture
 
@@ -270,33 +272,6 @@ User sends "change amount to 25" (or "!change ...")
         ├── amount/date changed → TransactWriteItems(Delete old SK + Put new SK)
         │                          GSI1PK and SK rewritten atomically
         └── other fields        → plain UpdateItem on existing key
-```
-
-### Query
-
-```
-User sends "how much did I spend on food this month?"
-        │
-        ▼
-  intent_classifier → "query"
-        │
-        ▼
-  agent/query_agent.py
-  Bedrock Converse (Claude Haiku 4.5) with toolConfig
-        │
-        ▼
-  Tool-use loop (≤4 iterations):
-        │
-        ├── get_today()
-        ├── query_transactions(date_from, date_to, category_slug?, ...)
-        ├── aggregate_by_category(date_from, date_to)
-        └── list_recent_transactions(limit)
-        │
-        ▼
-  Final assistant message: {"answer": "...", "source_txn_ids": [...]}
-        │
-        ▼
-  Bot reply: <answer> + "Based on: #1, #5, #12"
 ```
 
 ### Monthly Reconciliation
@@ -373,14 +348,14 @@ Both entry points share `agent/reconciliation.auto_reconcile`, which means the b
 
 **Dashboard auth gate.** The dashboard reads `st.secrets["dashboard_password"]`; if set, an unauthenticated session sees only a sign-in form and `st.stop()` is called until the password matches. The secrets file is gitignored and a `.streamlit/secrets.toml.example` template is checked in.
 
-**Bedrock prompt caching.** System prompts for all three LLM tasks use `cachePoint` blocks. On repeated invocations within the cache TTL (5 minutes), the system prompt tokens are served from cache at ~10% of the normal input token cost.
+**Bedrock prompt caching.** System prompts for all LLM tasks use `cachePoint` blocks. On repeated invocations within the cache TTL (5 minutes), the system prompt tokens are served from cache at ~10% of the normal input token cost.
 
 **Content-hash IDs for statement lines.** Statement lines use a deterministic `blake2b(6)` hash of `(account_id, billing_period, date, description, amount_cents)` as their ID. This makes re-importing the same statement idempotent without a separate unique index.
 
 **S3 tmp→final copy pattern.** Images are staged at a short-lived tmp key before the transaction ID is known. On confirmation, they are copied to the final key and the tmp object is deleted. A 1-day lifecycle rule on `receipts/tmp/` cleans up any orphaned uploads.
 
-**Intent classifier fails open.** If the classifier errors or returns an unrecognized intent, the message is treated as `new_transaction`. Rationale: missing a new transaction silently loses user data; misclassifying a query or edit only prompts the user to rephrase. Fail toward the costliest-to-skip intent.
+**Intent classifier fails open.** If the classifier errors or returns an unrecognized intent, the message is treated as `new_transaction`. Rationale: missing a new transaction silently loses user data; misclassifying an edit only prompts the user to rephrase. Fail toward the costliest-to-skip intent.
 
 **Edit-key rewrite uses TransactWriteItems.** A transaction's primary SK and `GSI1PK` both encode `amount` and `date`. When the user edits either field, `update_transaction_fields` deletes the old item and puts the new one in a single atomic transaction (via the low-level `TransactWriteItems` API and `boto3.dynamodb.types.TypeSerializer`). All non-key fields (`id`, `created_at`, `reconciliation_status`, `telegram_image_id`, `image_path`) are preserved verbatim. Other field edits use plain `UpdateItem`.
 
-**Query agent commits to citations.** The query agent's final response is a JSON envelope `{answer, source_txn_ids}`. Forcing the model to enumerate the transaction ids that back its answer makes hallucinations cheaper to detect and gives the user a self-serve verification path.
+**Periodic insights are LLM-free.** A scheduled Lambda (`insights_handler.py`) aggregates DynamoDB the same way as the widget (`api/aggregator.build_summary`) plus a rolling seven-day category rollup (`api/insights`), formats plain text, and posts to Telegram. No Bedrock on that path — bounded cost and predictable output.

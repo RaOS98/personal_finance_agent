@@ -12,19 +12,19 @@ An AI-powered agent that runs on Telegram. The user sends photos of receipts, tr
 
 ## How It Works
 
-1. **Route** — Free-form text messages are first classified into one of three intents: `new_transaction`, `edit`, or `query`. Photos always route directly to the new-transaction flow. The `!` and `?` prefixes force the edit and query flows respectively.
+1. **Route** — Free-form text messages are classified into `new_transaction` or `edit`. Photos always route directly to the new-transaction flow. Prefix `!` forces the edit flow.
 2. **Capture** — For new transactions, send a photo or text message to the Telegram bot with basic context (e.g., "Sapphire, groceries"). Claude Sonnet reads the image and extracts merchant name, amount, date, and currency.
 3. **Confirm** — The agent replies with a structured summary for the user to approve or correct.
 4. **Store** — Confirmed transactions are saved to DynamoDB; receipt images go to S3.
 5. **Edit** — Send a natural-language correction (e.g., "change amount to 25") to update the most recent transaction. The bot shows a yes/no diff before any write.
-6. **Query** — Ask questions in plain English or Spanish (e.g., "how much did I spend on food this month?"). The agent runs a tool-use loop over DynamoDB and replies with cited transaction ids.
-7. **Reconcile** — Monthly bank statement PDFs are uploaded either through the Telegram bot or the Streamlit dashboard. Python pre-filters by signed amount and date; the agent evaluates all candidates for a statement line in one batched call. Confident singletons auto-match (with a date-diff tiebreaker for ties); everything else is reviewed in the dashboard's Manual Reconciliation page.
-8. **Visualize and edit** — A local Streamlit dashboard backed by DynamoDB provides real-time visibility into spending and a writeable surface for transaction edits, statement uploads, and manual reconciliation. A simple shared-password gate via `st.secrets` keeps it out of casual hands.
+6. **Reconcile** — Monthly bank statement PDFs are uploaded either through the Telegram bot or the Streamlit dashboard. Python pre-filters by signed amount and date; the agent evaluates all candidates for a statement line in one batched call. Confident singletons auto-match (with a date-diff tiebreaker for ties); everything else is reviewed in the dashboard's Manual Reconciliation page.
+7. **Visualize and edit** — A local Streamlit dashboard backed by DynamoDB provides real-time visibility into spending and a writeable surface for transaction edits, statement uploads, and manual reconciliation. A simple shared-password gate via `st.secrets` keeps it out of casual hands.
+8. **Periodic insights** — A scheduled Lambda (no LLM) reads DynamoDB, formats a short digest (month-to-date totals, top categories, last-seven-day roll-up, unreconciled count), and sends it to your Telegram chat. See `insights_handler.py` and EventBridge in `template.yaml`.
 
 ## Architecture
 
-- **Runtime**: AWS Lambda (python3.12, arm64), triggered by Telegram webhook via API Gateway HTTP API
-- **AI**: Amazon Bedrock — Claude Sonnet 4.6 for vision extraction, Claude Haiku 4.5 for intent classification, categorization, edit parsing, query tool-use, and reconciliation
+- **Runtime**: AWS Lambda (python3.12, arm64): Telegram webhook via API Gateway HTTP API; weekly insights digest via EventBridge schedule (`pfa-insights`, no Bedrock)
+- **AI**: Amazon Bedrock — Claude Sonnet 4.6 for vision extraction, Claude Haiku 4.5 for intent classification, categorization, edit parsing, and reconciliation
 - **Database**: DynamoDB single-table design with three GSIs
 - **Storage**: S3 for receipt images and bank statement PDFs (Standard → Standard-IA lifecycle)
 - **Secrets**: AWS SSM Parameter Store (Telegram tokens), `.streamlit/secrets.toml` (dashboard password)
@@ -194,5 +194,5 @@ above; remember to update both in tandem if a category is added.
 
 - Additional banks and cards (Interbank, BBVA, Cencosud Scotiabank)
 - Income tracking (salary, recurring inflows)
-- Automated spending insights and alerts
+- Richer insight templates (budgets, anomaly flags) on top of the scheduled digest
 - Budget tracking and goals
